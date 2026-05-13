@@ -1,0 +1,39 @@
+{
+  "name": "coding-agent",
+  "version": "1.0.0",
+  "description": "A CLI coding agent powered by AI",
+  "type": "module",
+  "main": "dist/index.js",
+  "bin": {
+    "coding-agent": "dist/index.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsx src/index.ts",
+    "start": "node dist/index.js",
+    "typecheck": "tsc --noEmit"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/render-ydb/coding-agent.git"
+  },
+  "keywords": [
+    "cli",
+    "agent",
+    "coding"
+  ],
+  "author": "",
+  "license": "ISC",
+  "bugs": {
+    "url": "https://github.com/render-ydb/coding-agent/issues"
+  },
+  "homepage": "https://github.com/render-ydb/coding-agent#readme",
+  "devDependencies": {
+    "@types/node": "^25.7.0",
+    "tsx": "^4.21.0",
+    "typescript": "^6.0.3"
+  },
+  "dependencies": {
+    "dotenv": "^17.4.2"
+  }
+}
