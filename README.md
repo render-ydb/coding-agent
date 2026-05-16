@@ -1,0 +1,164 @@
+# Coding Agent
+
+从零实现的最小可用 AI 编程助手 CLI，使用 TypeScript 构建。
+
+实现了经典的 **Tool-Use Agent Loop**：用户输入 → LLM 决策 → 调用工具 → 执行工具 → 返回结果 → 循环直到完成。
+
+```
+┌──────────┐     ┌──────────┐     ┌──────────┐
+│  用户    │ ──> │  Agent   │ ──> │ Anthropic│
+│  (CLI)   │ <── │  Loop    │ <── │  API     │
+└──────────┘     └────┬─────┘     └──────────┘
+                      │
+                 ┌────▼─────┐
+                 │  Tools   │
+                 └──────────┘
+```
+
+## 快速开始
+
+```bash
+# 安装依赖
+npm install
+
+# 配置环境变量
+cp .env.example .env
+# 编辑 .env，填入 API Key、Base URL 和模型名称
+
+# 开发模式运行
+npm run dev
+
+# 或者构建后运行
+npm run build && npm start
+```
+
+## 已实现功能
+
+### 核心引擎
+
+| 功能 | 说明 | 代码位置 |
+|------|------|---------|
+| Tool-Use Agent Loop | 用户输入 → LLM → tool_use → 执行 → tool_result → 循环 | `src/agent.ts` `chat()` |
+| 流式响应 | 通过 Anthropic Streaming API 实时输出文本 | `src/agent.ts` `callApi()` |
+| 中断支持 | Ctrl+C 通过 AbortController 中断正在进行的 API 请求 | `src/agent.ts` `abort()` |
+| 预算控制 | 支持最大花费（美元）和最大轮次限制，超出自动停止 | `src/agent.ts` `isBudgetExceeded()` |
+| Token 统计 | 累计输入/输出 token 计数和费用估算 | `src/agent.ts` `getTokenUsage()` |
+
+### 工具系统
+
+| 工具 | 功能 | 代码位置 |
+|------|------|---------|
+| `read_file` | 读取文件内容，支持指定行范围 | `src/tools/builtin/read-file.ts` |
+| `write_file` | 创建或覆写文件 | `src/tools/builtin/write-file.ts` |
+| `edit_file` | 精确字符串替换编辑 | `src/tools/builtin/edit-file.ts` |
+| `list_files` | 递归列出目录内容 | `src/tools/builtin/list-files.ts` |
+| `grep_search` | 正则表达式跨文件搜索 | `src/tools/builtin/grep-search.ts` |
+| `run_shell` | 执行 shell 命令，支持超时控制 | `src/tools/builtin/run-shell.ts` |
+
+### 权限系统
+
+| 模式 | 启动参数 | 行为 |
+|------|---------|------|
+| `default` | *(无)* | 危险命令和新文件写入需要用户确认 |
+| `bypassPermissions` | `--yolo` / `-y` | 跳过所有确认提示 |
+| `acceptEdits` | `--accept-edits` | 自动批准文件编辑，危险 shell 命令仍需确认 |
+| `plan` | `--plan` | 只读模式，拒绝所有写操作 |
+| `dontAsk` | `--dont-ask` | 自动拒绝所有需要确认的操作（CI 模式） |
+
+危险命令检测覆盖：`rm`、`git push/reset/clean`、`sudo`、`mkfs`、`dd`、`kill`、`reboot`、`shutdown`，以及 Windows 等价命令（`del`、`rmdir`、`format`、`taskkill`、`Remove-Item`、`Stop-Process`）。
+
+### 上下文管理（5 层递进压缩管道）
+
+| 层级 | 名称 | 触发条件 | 策略 | API 开销 |
+|------|------|---------|------|---------|
+| Tier 0 | 大结果持久化 | 单条结果 > 30KB | 写入磁盘，上下文仅保留 200 行预览 | 0 |
+| Tier 1 | 预算截断 | 上下文利用率 > 50% | 保留结果头部 + 尾部，裁剪中间 | 0 |
+| Tier 2 | 过期结果 Snip | 上下文利用率 > 60% | 旧的/重复的工具结果替换为占位符 | 0 |
+| Tier 3 | 微压缩 | 空闲 > 5 分钟 | 激进清理所有旧结果（prompt cache 已过期） | 0 |
+| Tier 4 | 自动摘要压缩 | 上下文利用率 > 85% | 通过一次 API 调用将整个对话压缩为摘要 | 1 次 API |
+
+详细设计文档见 [docs/context-management-design.md](docs/context-management-design.md)。
+
+### API 容错
+
+| 功能 | 说明 |
+|------|------|
+| 指数退避重试 | 遇到 429/503/529/ECONNRESET/ETIMEDOUT 自动重试，带随机抖动 |
+| 最多 3 次重试 | 超过重试次数后抛出原始错误 |
+| 中断感知 | 用户 Ctrl+C 时立即终止重试循环 |
+| 代理支持 | 兼容 Anthropic 官方 API 和任意兼容代理（litellm 等） |
+
+### CLI 与 REPL
+
+| 功能 | 说明 |
+|------|------|
+| 交互式 REPL | 基于 readline 的持久对话循环 |
+| 单次模式 | 通过参数传入 prompt：`coding-agent "修复这个 bug"` |
+| `/clear` | 清空对话历史 |
+| `/cost` | 显示 token 用量和估算费用 |
+| `/compact` | 手动触发对话压缩 |
+| 双次 Ctrl+C | 第一次中断当前请求，第二次退出程序 |
+
+### 命令行参数
+
+```
+--yolo, -y          跳过所有权限检查
+--plan              只读规划模式
+--accept-edits      自动批准文件编辑
+--dont-ask          自动拒绝确认（CI 模式）
+--thinking          启用扩展思考
+--resume            恢复上次会话（开发中）
+--max-cost <美元>    设定最大花费上限
+--max-turns <次数>   设定最大工具执行轮次
+--help, -h          显示帮助
+--version, -v       显示版本
+```
+
+## 项目结构
+
+```
+coding-agent/
+├── src/
+│   ├── index.ts              # CLI 入口：参数解析、REPL 循环、.env 配置加载
+│   ├── agent.ts              # 核心引擎：Agent Loop、流式响应、上下文压缩
+│   └── tools/
+│       ├── index.ts           # 工具注册表和路由器
+│       ├── types.ts           # ToolDefinition 接口定义
+│       ├── permissions.ts     # 权限模式和危险命令检测
+│       └── builtin/
+│           ├── index.ts       # 注册所有内置工具
+│           ├── read-file.ts   # 读取文件
+│           ├── write-file.ts  # 写入文件
+│           ├── edit-file.ts   # 编辑文件
+│           ├── list-files.ts  # 列出文件
+│           ├── grep-search.ts # 搜索文件
+│           └── run-shell.ts   # 执行命令
+├── docs/
+│   └── context-management-design.md  # 上下文管理设计文档
+├── package.json
+├── tsconfig.json
+└── .env                       # API_KEY, API_BASE_URL, MODEL
+```
+
+## 环境配置
+
+在项目根目录创建 `.env` 文件：
+
+```env
+API_KEY=your-api-key
+API_BASE_URL=https://your-api-endpoint/v1
+MODEL=claude-sonnet-4-6
+```
+
+Agent 同时发送 `x-api-key` 和 `Authorization: Bearer` 请求头，兼容 Anthropic 官方 API 和 litellm 等代理网关。
+
+## 技术栈
+
+| 组件 | 选型 |
+|------|------|
+| 运行时 | Node.js |
+| 语言 | TypeScript（严格模式） |
+| LLM SDK | `@anthropic-ai/sdk` |
+| 环境变量 | `dotenv` |
+| 构建 | `tsc`（ESM 模块） |
+| 开发 | `tsx`（免构建运行） |
