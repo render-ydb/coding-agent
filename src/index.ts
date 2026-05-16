@@ -11,28 +11,8 @@
  */
 
 import * as readline from "node:readline";
-import "dotenv/config"; // 自动加载项目根目录下的 .env 文件到 process.env
-
-// ─────────────────────────────────────────────────────────
-// 类型定义
-// ─────────────────────────────────────────────────────────
-
-/**
- * 权限模式枚举
- *
- * 控制工具执行时的权限确认行为，从最宽松到最严格：
- * - bypassPermissions: 跳过所有确认提示，适合信任环境下的快速执行
- * - acceptEdits:       自动批准文件编辑操作，但危险的 shell 命令仍需确认
- * - default:           默认模式，危险操作和新文件写入需要用户确认
- * - plan:              只读规划模式，禁止所有写操作（仅允许写入计划文件）
- * - dontAsk:           自动拒绝所有需要确认的操作，适合 CI/CD 环境
- */
-type PermissionMode =
-  | "bypassPermissions"
-  | "acceptEdits"
-  | "default"
-  | "plan"
-  | "dontAsk";
+import "dotenv/config";
+import { Agent, type PermissionMode } from "./agent.js";
 
 /**
  * 命令行参数解析结果
@@ -309,27 +289,27 @@ function printInfo(msg: string): void {
  *
  * @param config 解析后的 CLI 参数，用于将来传递给 Agent 实例
  */
-async function runRepl(_config: ParsedArgs): Promise<void> {
-  // 创建 readline 接口
-  // 整个 REPL 生命周期只使用这一个实例
+async function runRepl(agent: Agent): Promise<void> {
   const rl = readline.createInterface({
     input: process.stdin,
     output: process.stdout,
   });
 
-  // ── Ctrl+C (SIGINT) 处理 ──
-  // sigintCount 追踪连续 Ctrl+C 的次数
-  // 第一次：中断当前操作或显示提示
-  // 第二次：退出程序
+  // 提供 confirmFn，复用 readline 实例
+  agent.setConfirmFn((message: string) => {
+    return new Promise((resolve) => {
+      rl.question(`  ${message} (y/n): `, (answer) => {
+        resolve(answer.toLowerCase().startsWith("y"));
+      });
+    });
+  });
+
   let sigintCount = 0;
-  // isProcessing 标记 Agent 是否正在处理请求
-  // 后续接入 Agent 后，由 Agent 控制此状态
   let isProcessing = false;
 
   process.on("SIGINT", () => {
     if (isProcessing) {
-      // Agent 正在处理中 → 中断当前操作
-      // TODO: 接入 Agent 后调用 agent.abort()
+      agent.abort();
       console.log("\n  (interrupted)");
       isProcessing = false;
       sigintCount = 0;
@@ -384,8 +364,7 @@ async function runRepl(_config: ParsedArgs): Promise<void> {
       // 未匹配的 / 命令会被当作普通输入传给 Agent
 
       if (input === "/clear") {
-        // 清空对话历史，重新开始
-        // TODO: 接入 Agent 后调用 agent.clearHistory()
+        agent.clearHistory();
         printInfo("Conversation cleared.");
         askQuestion();
         return;
@@ -400,9 +379,7 @@ async function runRepl(_config: ParsedArgs): Promise<void> {
       }
 
       if (input === "/cost") {
-        // 显示当前 token 用量和估算费用
-        // TODO: 接入 Agent 后调用 agent.showCost()
-        printInfo("Token usage: 0 in / 0 out (~$0.0000)");
+        agent.showCost();
         askQuestion();
         return;
       }
@@ -451,10 +428,7 @@ async function runRepl(_config: ParsedArgs): Promise<void> {
       // ── 普通用户输入 → 发送给 Agent ──
       try {
         isProcessing = true;
-        // TODO: 接入 Agent 后替换为 await agent.chat(input)
-        // 目前仅回显输入作为占位
-        console.log(`\n  [Agent] Received: "${input}"`);
-        console.log("  [Agent] (Agent not yet implemented)");
+        await agent.chat(input);
       } catch (e: unknown) {
         // 捕获 Agent 处理中的异常
         // AbortError 是用户主动中断，无需报错
@@ -511,16 +485,14 @@ async function main(): Promise<void> {
     process.exit(1);
   }
 
-  // Step 3: 创建 Agent 实例
-  // TODO: 实现 Agent 类后在此处实例化
-  // const agent = new Agent({
-  //   permissionMode: config.permissionMode,
-  //   thinking: config.thinking,
-  //   maxCostUsd: config.maxCost,
-  //   maxTurns: config.maxTurns,
-  //   apiKey: apiConfig.apiKey,
-  //   apiBaseUrl: apiConfig.apiBaseUrl,
-  // });
+  const agent = new Agent({
+    permissionMode: config.permissionMode,
+    maxCostUsd: config.maxCost,
+    maxTurns: config.maxTurns,
+    apiKey: apiConfig.apiKey,
+    apiBaseUrl: apiConfig.apiBaseUrl,
+    model: apiConfig.model,
+  });
 
   printInfo(
     `Config: model=${apiConfig.model}, mode=${config.permissionMode}, api=${apiConfig.apiBaseUrl}` +
@@ -529,35 +501,20 @@ async function main(): Promise<void> {
       (config.maxTurns ? `, maxTurns=${config.maxTurns}` : "")
   );
 
-  // Step 4: 恢复会话（如果 --resume）
   if (config.resume) {
-    // TODO: 接入 session 模块后恢复会话
-    // const sessionId = getLatestSessionId();
-    // if (sessionId) {
-    //   const session = loadSession(sessionId);
-    //   if (session) agent.restoreSession(session);
-    // }
     printInfo("Session restore not yet implemented.");
   }
 
-  // Step 5: 选择运行模式
   if (config.prompt) {
-    // ── 一次性模式 ──
-    // 用户通过 CLI 参数直接提供了 prompt，执行后退出
-    // 典型用法: coding-agent "fix the bug in src/app.ts"
     try {
-      // TODO: 接入 Agent 后替换为 await agent.chat(config.prompt)
-      console.log(`\n  [One-shot] Prompt: "${config.prompt}"`);
-      console.log("  [One-shot] (Agent not yet implemented)");
+      await agent.chat(config.prompt);
     } catch (e: unknown) {
       const error = e as Error;
       printError(error.message);
       process.exit(1);
     }
   } else {
-    // ── REPL 交互模式 ──
-    // 没有提供 prompt，启动交互式循环
-    await runRepl(config);
+    await runRepl(agent);
   }
 }
 
