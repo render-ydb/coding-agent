@@ -385,9 +385,12 @@ async function runRepl(agent: Agent): Promise<void> {
       }
 
       if (input === "/compact") {
-        // 手动触发对话压缩（摘要历史消息以腾出上下文窗口）
-        // TODO: 接入 Agent 后调用 agent.compact()
-        printInfo("Conversation compacted. (not yet implemented)");
+        try {
+          await agent.compact();
+          printInfo("Conversation compacted.");
+        } catch (e: unknown) {
+          printError((e as Error).message);
+        }
         askQuestion();
         return;
       }

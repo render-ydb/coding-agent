@@ -92,6 +92,172 @@ You help users with software engineering tasks: fixing bugs, writing code, refac
 }
 
 // ─────────────────────────────────────────────────────────
+// 重试（指数退避）
+// ─────────────────────────────────────────────────────────
+
+/**
+ * 判断 API 错误是否可以安全重试
+ *
+ * 可重试的场景：
+ * - HTTP 429: 请求限流（Rate Limit），等一段时间后通常恢复
+ * - HTTP 503: 服务暂时不可用（Service Unavailable）
+ * - HTTP 529: Anthropic 自定义状态码，表示 API 过载
+ * - ECONNRESET: TCP 连接被对端重置（通常是网络抖动）
+ * - ETIMEDOUT: 连接超时（DNS 或 TCP 握手超时）
+ * - "overloaded": Anthropic API 返回的过载错误消息
+ *
+ * 不可重试的场景（会直接抛出）：
+ * - HTTP 400: 请求格式错误（重试也不会成功）
+ * - HTTP 401/403: 认证失败（密钥问题）
+ * - HTTP 404: 模型不存在
+ * - 编程错误（TypeError 等）
+ */
+function isRetryable(error: any): boolean {
+  const status = error?.status || error?.statusCode;
+  if ([429, 503, 529].includes(status)) return true;
+  if (error?.code === 'ECONNRESET' || error?.code === 'ETIMEDOUT') return true;
+  if (error?.message?.includes('overloaded')) return true;
+  return false;
+}
+
+/**
+ * 带指数退避的重试包装器
+ *
+ * 工作原理：
+ * 1. 执行传入的异步函数 fn
+ * 2. 如果成功，直接返回结果
+ * 3. 如果失败且可重试，等待一段时间后重试
+ * 4. 等待时间按指数增长：1s → 2s → 4s（加随机抖动防止惊群效应）
+ * 5. 最多重试 maxRetries 次（默认 3 次），之后抛出原始错误
+ *
+ * 指数退避公式：
+ *   delay = min(1000 * 2^attempt, 30000) + random(0, 1000)
+ *
+ *   attempt=0: ~1s,  attempt=1: ~2s,  attempt=2: ~4s
+ *
+ * 惊群效应（Thundering Herd）：
+ *   当多个客户端同时收到 429 后如果都在完全相同的时间重试，
+ *   服务器会再次过载。加随机抖动（jitter）让重试时间分散开。
+ *
+ * AbortSignal 支持：
+ *   如果外部发出中断信号（用户按 Ctrl+C），立即终止重试循环。
+ *
+ * @param fn         要执行的异步函数，接收 AbortSignal 参数
+ * @param signal     外部中断信号（来自 AbortController）
+ * @param maxRetries 最大重试次数，默认 3
+ * @returns          fn 的返回值
+ */
+async function withRetry<T>(
+  fn: (signal?: AbortSignal) => Promise<T>,
+  signal?: AbortSignal,
+  maxRetries = 3,
+): Promise<T> {
+  for (let attempt = 0; ; attempt++) {
+    try {
+      return await fn(signal);
+    } catch (error: any) {
+      // 用户主动中断 → 立即抛出，不重试
+      if (signal?.aborted) throw error;
+      // 超过重试次数或不可重试的错误 → 直接抛出
+      if (attempt >= maxRetries || !isRetryable(error)) throw error;
+      // 计算退避时间：指数增长 + 随机抖动
+      const delay =
+        Math.min(1000 * Math.pow(2, attempt), 30000) + Math.random() * 1000;
+      const reason = error?.status
+        ? `HTTP ${error.status}`
+        : error?.code || 'network error';
+      console.log(
+        `\n  ⟳ Retry ${attempt + 1}/${maxRetries} (${reason}), waiting ${(delay / 1000).toFixed(1)}s...`,
+      );
+      await new Promise((r) => setTimeout(r, delay));
+    }
+  }
+}
+
+// ─────────────────────────────────────────────────────────
+// 模型上下文窗口
+// ─────────────────────────────────────────────────────────
+
+/**
+ * 各模型的上下文窗口大小（单位：token）
+ *
+ * 上下文窗口 = 模型单次请求能处理的最大 token 总量（输入 + 输出）。
+ * 当对话历史接近此限制时，需要压缩（compact）以避免 API 报错。
+ *
+ * Claude 4.x 系列统一为 200K token。
+ * 如果模型不在列表中，默认使用 200K（安全保守值）。
+ */
+const MODEL_CONTEXT: Record<string, number> = {
+  'claude-opus-4-6': 200000,
+  'claude-sonnet-4-6': 200000,
+  'claude-haiku-4-5-20251001': 200000,
+  'claude-opus-4-20250514': 200000,
+  'claude-sonnet-4-20250514': 200000,
+};
+
+/**
+ * 根据模型名称查找上下文窗口大小
+ *
+ * 使用 includes 匹配而非精确匹配，因为实际使用时模型名可能带有
+ * 前缀（如 "anthropic/claude-sonnet-4-6"）或版本后缀。
+ */
+function getContextWindow(model: string): number {
+  for (const [key, value] of Object.entries(MODEL_CONTEXT)) {
+    if (model.includes(key)) return value;
+  }
+  return 200000;
+}
+
+// ─────────────────────────────────────────────────────────
+// 多层压缩常量
+// ─────────────────────────────────────────────────────────
+
+/**
+ * 可被 snip（裁剪）的工具集合
+ *
+ * 这些工具的结果通常较大且可以重新获取（re-read），
+ * 因此在上下文紧张时可以安全地用占位符替换。
+ * 模型看到占位符后会重新调用工具获取最新内容。
+ */
+const SNIPPABLE_TOOLS = new Set([
+  'read_file',
+  'grep_search',
+  'list_files',
+  'run_shell',
+]);
+
+/** snip 占位符文本，模型看到后知道可以重新读取 */
+const SNIP_PLACEHOLDER = '[Content snipped - re-read if needed]';
+
+/**
+ * Tier 2 触发阈值：上下文利用率超过 60% 时开始 snip 旧结果
+ *
+ * 选择 60% 的原因：
+ * - 50% 时 Tier 1（budgeting）已在截断单个大结果
+ * - 60% 时说明有很多工具结果积累，需要更激进的策略
+ * - 留出足够余量给后续 turn 的输入输出
+ */
+const SNIP_THRESHOLD = 0.6;
+
+/**
+ * Microcompact 冷却时间：5 分钟
+ *
+ * Anthropic 的 prompt cache TTL 为 5 分钟。
+ * 超过此时间后缓存失效，下次请求会重新计算整个上下文。
+ * 此时激进清理旧结果不会增加额外成本（因为缓存本来就要重建），
+ * 反而能减小上下文体积、加速后续请求。
+ */
+const MICROCOMPACT_IDLE_MS = 5 * 60 * 1000;
+
+/**
+ * 保留最近 N 个工具结果不被压缩
+ *
+ * 最近的结果通常与当前任务最相关，应始终保留。
+ * 3 是经验值：足够让模型回顾最近操作，又不占太多上下文。
+ */
+const KEEP_RECENT_RESULTS = 3;
+
+// ─────────────────────────────────────────────────────────
 // Agent 类
 // ─────────────────────────────────────────────────────────
 
@@ -136,14 +302,58 @@ export class Agent {
   private permissionMode: PermissionMode;
 
   // ── Token 统计 ──
+  /** 累计输入 token 数（所有 API 调用的 input_tokens 之和），用于费用估算 */
   private totalInputTokens = 0;
+  /** 累计输出 token 数（所有 API 调用的 output_tokens 之和），用于费用估算 */
   private totalOutputTokens = 0;
 
   // ── 预算控制 ──
+  /** 最大花费上限（美元），超过后 Agent Loop 自动停止。由 CLI --max-cost 参数设置 */
   private maxCostUsd?: number;
+  /** 最大工具执行轮次，超过后 Agent Loop 自动停止。由 CLI --max-turns 参数设置 */
   private maxTurns?: number;
-  /** 当前已执行的工具轮次（每次有 tool_use 时 +1） */
+  /** 当前已执行的工具轮次（每次 assistant 返回 tool_use 时 +1，纯文本响应不计数） */
   private currentTurns = 0;
+
+  // ── 上下文压缩状态 ──
+  /**
+   * 上一次 API 调用返回的输入 token 数
+   *
+   * 来自 response.usage.input_tokens，反映当前对话历史的实际 token 大小。
+   * 用于计算上下文利用率 = lastInputTokenCount / effectiveWindow，
+   * 各层压缩根据此利用率决定是否触发。
+   *
+   * 注意：这不是累计值，而是最近一次调用的快照值。
+   * 每次 API 调用后更新，compactConversation() 后重置为 0。
+   */
+  private lastInputTokenCount = 0;
+  /**
+   * 上一次 API 调用的时间戳（Date.now() 毫秒值）
+   *
+   * 用于 Tier 3（microcompact）判断 prompt cache 是否已冷却。
+   * 如果 Date.now() - lastApiCallTime > 5 分钟，说明缓存已失效，
+   * 可以激进清理旧结果而不增加额外成本。
+   *
+   * 初始值为 0，表示尚未进行过 API 调用。
+   */
+  private lastApiCallTime = 0;
+  /**
+   * 有效上下文窗口大小（token）
+   *
+   * = getContextWindow(model) - 20000
+   *
+   * 比模型的实际上下文窗口小 20,000 token，作为安全余量。
+   * 这 20K 预留给：
+   * - system prompt（约 500 token）
+   * - 工具定义（约 3000 token，6 个工具）
+   * - 模型的输出空间（max_tokens=16384）
+   * - API 请求/响应的元数据开销
+   *
+   * 例如：Claude Sonnet 4.6 的窗口为 200K
+   * → effectiveWindow = 200000 - 20000 = 180000
+   * → 上下文利用率 85% 时触发 auto-compact = 180000 × 0.85 = 153000 token
+   */
+  private effectiveWindow: number;
 
   // ── 中断支持 ──
   /**
@@ -186,6 +396,7 @@ export class Agent {
     this.maxCostUsd = options.maxCostUsd;
     this.maxTurns = options.maxTurns;
     this.systemPrompt = buildSystemPrompt();
+    this.effectiveWindow = getContextWindow(this.model) - 20000;
   }
 
   // ─── 公开方法 ────────────────────────────────────────
@@ -215,6 +426,8 @@ export class Agent {
     this.messages = [];
     this.totalInputTokens = 0;
     this.totalOutputTokens = 0;
+    this.lastInputTokenCount = 0;
+    this.lastApiCallTime = 0;
   }
 
   /** 显示当前 token 用量和估算费用 */
@@ -230,6 +443,11 @@ export class Agent {
           ? ` | Turns: ${this.currentTurns}/${this.maxTurns}`
           : ''),
     );
+  }
+
+  /** 手动触发对话压缩（由 REPL /compact 命令调用） */
+  async compact(): Promise<void> {
+    await this.compactConversation();
   }
 
   // ─── 核心 Agent Loop ─────────────────────────────────
@@ -253,8 +471,12 @@ export class Agent {
     this.abortController = new AbortController();
 
     try {
+      await this.checkAndCompact();
+
       while (true) {
         if (this.abortController.signal.aborted) break;
+
+        this.runCompressionPipeline();
 
         // ── 调用 LLM（流式） ──
         const response = await this.callApi();
@@ -262,6 +484,8 @@ export class Agent {
         // 记录 token 用量
         this.totalInputTokens += response.usage.input_tokens;
         this.totalOutputTokens += response.usage.output_tokens;
+        this.lastInputTokenCount = response.usage.input_tokens;
+        this.lastApiCallTime = Date.now();
 
         // 保存 assistant 响应到对话历史
         this.messages.push({ role: 'assistant', content: response.content });
@@ -343,32 +567,32 @@ export class Agent {
    * 流式打印文本内容给用户，最终返回完整 Message 对象。
    */
   private async callApi(): Promise<Anthropic.Message> {
-    const stream = this.client.messages.stream(
-      {
-        model: this.model,
-        max_tokens: 16384,
-        system: this.systemPrompt,
-        tools: toolDefinitions,
-        messages: this.messages,
-      },
-      { signal: this.abortController?.signal },
-    );
+    return withRetry(async (signal) => {
+      const stream = this.client.messages.stream(
+        {
+          model: this.model,
+          max_tokens: 16384,
+          system: this.systemPrompt,
+          tools: toolDefinitions,
+          messages: this.messages,
+        },
+        { signal },
+      );
 
-    let firstText = true;
-    // 这里显示的是给用户看的
-    stream.on('text', (text: string) => {
-      if (firstText) {
-        process.stdout.write('\n');
-        firstText = false;
-      }
-      process.stdout.write(text);
-    });
+      let firstText = true;
+      stream.on('text', (text: string) => {
+        if (firstText) {
+          process.stdout.write('\n');
+          firstText = false;
+        }
+        process.stdout.write(text);
+      });
 
-    // 这里获取的是最终的响应，包含所有信息，进行下一次loop
-    const finalMessage = await stream.finalMessage();
-    if (!firstText) process.stdout.write('\n');
+      const finalMessage = await stream.finalMessage();
+      if (!firstText) process.stdout.write('\n');
 
-    return finalMessage;
+      return finalMessage;
+    }, this.abortController?.signal);
   }
 
   // ─── 辅助方法 ────────────────────────────────────────
@@ -434,5 +658,338 @@ export class Agent {
     const preview = lines.slice(0, 5).join('\n');
     const more = lines.length > 5 ? `\n    ... (${lines.length} lines)` : '';
     console.log(`  ◀ ${name}:\n    ${preview.replace(/\n/g, '\n    ')}${more}`);
+  }
+
+  // ─── 上下文压缩管道 ─────────────────────────────────
+
+  /**
+   * 运行零 API 开销的压缩管道（Tier 1-3）
+   *
+   * 在每次 API 调用前执行，按激进程度递增：
+   * - Tier 1: 按预算截断大结果（上下文 > 50%）
+   * - Tier 2: 用占位符替换旧/重复的工具结果（上下文 > 60%）
+   * - Tier 3: 缓存冷却后激进清理（空闲 > 5 分钟）
+   */
+  private runCompressionPipeline(): void {
+    this.budgetToolResults();
+    this.snipStaleResults();
+    this.microcompact();
+  }
+
+  /**
+   * Tier 1: 按预算动态截断大工具结果
+   *
+   * 当上下文利用率超过 50% 时启用。原理：
+   *
+   * 1. 计算当前利用率 = lastInputTokenCount / effectiveWindow
+   * 2. 根据利用率确定"字符预算"：
+   *    - 50%~70%: 预算 30,000 字符（宽松）
+   *    - >70%:    预算 15,000 字符（紧凑）
+   * 3. 遍历所有 tool_result 块，超出预算的保留头尾各一半
+   *
+   * 为什么保留头尾而非只保留头部？
+   * - 头部：包含文件开头、命令输出的初始信息
+   * - 尾部：包含错误信息、最终结果、返回值
+   * - 中间：通常是重复性内容（代码行、日志条目）
+   *
+   * 注意：此操作直接修改 messages 数组中的内容（原地修改），
+   * 被截断的数据无法恢复，模型需要重新调用工具才能获取完整内容。
+   */
+  private budgetToolResults(): void {
+    const utilization = this.lastInputTokenCount / this.effectiveWindow;
+    if (utilization < 0.5) return;
+    const budget = utilization > 0.7 ? 15000 : 30000;
+
+    for (const msg of this.messages) {
+      if (msg.role !== 'user' || !Array.isArray(msg.content)) continue;
+      for (const block of msg.content as any[]) {
+        if (
+          block.type === 'tool_result' &&
+          typeof block.content === 'string' &&
+          block.content.length > budget
+        ) {
+          // 保留 (budget - 80) / 2 字符的头部和尾部，80 是截断提示文本的预留
+          const keepEach = Math.floor((budget - 80) / 2);
+          block.content =
+            block.content.slice(0, keepEach) +
+            `\n\n[... budgeted: ${block.content.length - keepEach * 2} chars truncated ...]\n\n` +
+            block.content.slice(-keepEach);
+        }
+      }
+    }
+  }
+
+  /**
+   * Tier 2: 用占位符替换旧/重复的工具结果
+   *
+   * 当上下文利用率超过 SNIP_THRESHOLD（60%）时启用。
+   *
+   * 算法流程：
+   * 1. 收集所有 SNIPPABLE_TOOLS 的 tool_result 块（跳过已被 snip 的）
+   * 2. 通过 tool_use_id 反查对应的 assistant 消息，获取工具名和输入参数
+   * 3. 确定哪些结果需要被 snip：
+   *    a. 去重：同一文件被 read_file 多次 → 只保留最后一次
+   *    b. 老化：超出 KEEP_RECENT_RESULTS（3）的旧结果全部 snip
+   * 4. 将选中的结果内容替换为 SNIP_PLACEHOLDER
+   *
+   * 为什么模型不会因为结果被 snip 而出错？
+   * - 占位符 "[Content snipped - re-read if needed]" 明确告知模型数据已被裁剪
+   * - 模型会自动重新调用 read_file 等工具获取最新内容
+   * - 这是一种"惰性保留"策略：只在模型真正需要时才加载完整数据
+   *
+   * 数据结构说明：
+   * - msgIdx/blockIdx: 定位到 messages[msgIdx].content[blockIdx] 的 tool_result 块
+   * - seenFiles: 记录每个文件路径被读取的所有位置索引，用于去重
+   * - toSnip: 最终需要替换的结果索引集合
+   */
+  private snipStaleResults(): void {
+    const utilization = this.lastInputTokenCount / this.effectiveWindow;
+    if (utilization < SNIP_THRESHOLD) return;
+
+    // Step 1: 收集所有可 snip 的 tool_result 及其位置信息
+    const results: {
+      msgIdx: number;
+      blockIdx: number;
+      toolName: string;
+      filePath?: string;
+    }[] = [];
+
+    for (let mi = 0; mi < this.messages.length; mi++) {
+      const msg = this.messages[mi];
+      if (msg.role !== 'user' || !Array.isArray(msg.content)) continue;
+      for (let bi = 0; bi < msg.content.length; bi++) {
+        const block = msg.content[bi] as any;
+        if (
+          block.type === 'tool_result' &&
+          typeof block.content === 'string' &&
+          block.content !== SNIP_PLACEHOLDER
+        ) {
+          // 通过 tool_use_id 反查 assistant 消息中的 tool_use 块
+          // 获取工具名和输入参数（如 file_path）
+          const toolInfo = this.findToolUseById(block.tool_use_id);
+          if (toolInfo && SNIPPABLE_TOOLS.has(toolInfo.name)) {
+            results.push({
+              msgIdx: mi,
+              blockIdx: bi,
+              toolName: toolInfo.name,
+              filePath: toolInfo.input?.file_path,
+            });
+          }
+        }
+      }
+    }
+
+    // 结果数量少于保留阈值，无需 snip
+    if (results.length <= KEEP_RECENT_RESULTS) return;
+
+    const toSnip = new Set<number>();
+    const seenFiles = new Map<string, number[]>();
+
+    // Step 2: 记录同一文件的所有读取位置
+    for (let i = 0; i < results.length; i++) {
+      const r = results[i];
+      if (r.toolName === 'read_file' && r.filePath) {
+        const existing = seenFiles.get(r.filePath) || [];
+        existing.push(i);
+        seenFiles.set(r.filePath, existing);
+      }
+    }
+
+    // Step 3a: 同一文件的早期读取全部标记为 snip（只保留最后一次）
+    for (const indices of seenFiles.values()) {
+      if (indices.length > 1) {
+        for (let j = 0; j < indices.length - 1; j++) toSnip.add(indices[j]);
+      }
+    }
+
+    // Step 3b: 超出保留数量的旧结果全部标记为 snip
+    const snipBefore = results.length - KEEP_RECENT_RESULTS;
+    for (let i = 0; i < snipBefore; i++) toSnip.add(i);
+
+    // Step 4: 执行替换
+    for (const idx of toSnip) {
+      const r = results[idx];
+      const block = (this.messages[r.msgIdx].content as any[])[r.blockIdx];
+      block.content = SNIP_PLACEHOLDER;
+    }
+  }
+
+  /**
+   * Tier 3: Microcompact —— 缓存冷却后激进清理
+   *
+   * 触发条件：距上次 API 调用超过 5 分钟（MICROCOMPACT_IDLE_MS）
+   *
+   * 背景：
+   * Anthropic 的 prompt cache 有 5 分钟的 TTL（Time To Live）。
+   * 如果用户离开了一段时间再回来，cache 已经失效了，
+   * 下次请求会重新处理整个上下文（无论是否压缩）。
+   * 既然 cache 反正要重建，不如趁机激进清理，减小上下文体积。
+   *
+   * 与 Tier 2 的区别：
+   * - Tier 2 只 snip SNIPPABLE_TOOLS 的结果
+   * - Tier 3 清理所有 tool_result（不区分工具类型）
+   * - Tier 3 用 "[Old result cleared]" 而非 SNIP_PLACEHOLDER
+   *
+   * 使用不同占位符的原因：
+   * - SNIP_PLACEHOLDER 暗示"可以重新读取"，适合 read_file 等
+   * - "[Old result cleared]" 语义更强，表示"这是旧数据，已不再相关"
+   */
+  private microcompact(): void {
+    // 首次调用（lastApiCallTime=0）或冷却时间未到 → 跳过
+    if (
+      !this.lastApiCallTime ||
+      Date.now() - this.lastApiCallTime < MICROCOMPACT_IDLE_MS
+    )
+      return;
+
+    // 收集所有未被清理的 tool_result 块
+    const allResults: { msgIdx: number; blockIdx: number }[] = [];
+    for (let mi = 0; mi < this.messages.length; mi++) {
+      const msg = this.messages[mi];
+      if (msg.role !== 'user' || !Array.isArray(msg.content)) continue;
+      for (let bi = 0; bi < msg.content.length; bi++) {
+        const block = msg.content[bi] as any;
+        if (
+          block.type === 'tool_result' &&
+          typeof block.content === 'string' &&
+          block.content !== SNIP_PLACEHOLDER &&
+          block.content !== '[Old result cleared]'
+        ) {
+          allResults.push({ msgIdx: mi, blockIdx: bi });
+        }
+      }
+    }
+
+    // 保留最近 KEEP_RECENT_RESULTS 个，清理其余
+    const clearCount = allResults.length - KEEP_RECENT_RESULTS;
+    for (let i = 0; i < clearCount && i < allResults.length; i++) {
+      const r = allResults[i];
+      (this.messages[r.msgIdx].content as any[])[r.blockIdx].content =
+        '[Old result cleared]';
+    }
+  }
+
+  /**
+   * Tier 4: 自动压缩检查
+   *
+   * 在每轮对话开始时（chat() 入口处）调用。
+   * 当上下文利用率超过 85% 时，触发 compactConversation() 做 API 摘要。
+   *
+   * 为什么阈值是 85% 而不是更高？
+   * - 模型的单次输出也会占用上下文空间（max_tokens=16384）
+   * - 需要留出余量给下一轮的输入+输出
+   * - 85% + 模型输出 ≈ 接近 100%，再高可能导致 API 报错
+   *
+   * 为什么在 chat() 入口而不是循环内？
+   * - 循环内已有 Tier 1-3 的零开销压缩
+   * - Tier 4 需要一次额外的 API 调用（有成本），不应频繁触发
+   * - 放在轮次边界确保上一轮的 tool_result 不会被破坏
+   */
+  private async checkAndCompact(): Promise<void> {
+    if (this.lastInputTokenCount > this.effectiveWindow * 0.85) {
+      console.log(
+        '\n  ℹ Context window filling up, compacting conversation...',
+      );
+      await this.compactConversation();
+    }
+  }
+
+  /**
+   * 对话摘要压缩（核心实现）
+   *
+   * 通过一次 API 调用将整个对话历史压缩为一段摘要文本。
+   *
+   * 流程：
+   * 1. 保存最后一条 user 消息（当前轮的输入，需要保留）
+   * 2. 将历史消息（去掉最后一条）+ "请总结" 指令发送给模型
+   * 3. 用模型返回的摘要重建 messages 数组：
+   *    [摘要(user)] → [确认(assistant)] → [当前输入(user)]
+   * 4. 重置 lastInputTokenCount，让后续的利用率计算重新开始
+   *
+   * 压缩后的 messages 结构：
+   *   messages[0]: { role: "user", content: "[Previous conversation summary]\n..." }
+   *   messages[1]: { role: "assistant", content: "Understood..." }
+   *   messages[2]: { role: "user", content: "（当前轮的用户输入）" }
+   *
+   * 这个 3 条消息的结构满足 Anthropic API 的交替规则（user→assistant→user），
+   * 同时为模型提供了足够的历史上下文继续工作。
+   *
+   * 安全阈值：messages.length < 4 时不压缩（对话太短没有压缩价值）。
+   */
+  private async compactConversation(): Promise<void> {
+    if (this.messages.length < 4) return;
+
+    // 保存最后一条消息（当前轮的 user 输入）
+    const lastUserMsg = this.messages[this.messages.length - 1];
+
+    // 调用 API 生成对话摘要
+    const summaryResp = await this.client.messages.create({
+      model: this.model,
+      max_tokens: 2048,
+      system:
+        'You are a conversation summarizer. Be concise but preserve important details.',
+      messages: [
+        // 历史消息（不含最后一条 user 输入）
+        ...this.messages.slice(0, -1),
+        // 替换为"请总结"指令
+        {
+          role: 'user',
+          content:
+            'Summarize the conversation so far in a concise paragraph, preserving key decisions, file paths, and context needed to continue the work.',
+        },
+      ],
+    });
+
+    // 提取摘要文本
+    const summaryText =
+      summaryResp.content[0]?.type === 'text'
+        ? summaryResp.content[0].text
+        : 'No summary available.';
+
+    // 用摘要重建 messages 数组
+    this.messages = [
+      {
+        role: 'user',
+        content: `[Previous conversation summary]\n${summaryText}`,
+      },
+      {
+        role: 'assistant',
+        content:
+          'Understood. I have the context from our previous conversation. How can I continue helping?',
+      },
+    ];
+    // 把当前轮的 user 输入追加回去
+    if (lastUserMsg.role === 'user') this.messages.push(lastUserMsg);
+    this.lastInputTokenCount = 0;
+    console.log('  ℹ Conversation compacted.');
+  }
+
+  /**
+   * 在 assistant 消息中查找指定 ID 的 tool_use block
+   *
+   * Anthropic API 的消息结构：
+   * - assistant 消息的 content 数组中包含 tool_use blocks（模型决定调用的工具）
+   * - user 消息的 content 数组中包含 tool_result blocks（工具执行的结果）
+   * - 两者通过 tool_use_id 关联
+   *
+   * 本方法用于 Tier 2 压缩中：
+   * 已知一个 tool_result 的 tool_use_id，需要反查对应的工具名称和输入参数，
+   * 以判断该结果是否属于 SNIPPABLE_TOOLS、是否是同一文件的重复读取。
+   *
+   * @param toolUseId  tool_result 块中的 tool_use_id 字段
+   * @returns          对应的工具名称和输入参数，未找到返回 null
+   */
+  private findToolUseById(
+    toolUseId: string,
+  ): { name: string; input: any } | null {
+    for (const msg of this.messages) {
+      if (msg.role !== 'assistant' || !Array.isArray(msg.content)) continue;
+      for (const block of msg.content as any[]) {
+        if (block.type === 'tool_use' && block.id === toolUseId) {
+          return { name: block.name, input: block.input };
+        }
+      }
+    }
+    return null;
   }
 }
