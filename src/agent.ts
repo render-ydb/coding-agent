@@ -31,6 +31,7 @@ import {
   checkPermission,
   type PermissionMode,
 } from './tools/index.js';
+import { McpManager } from './mcp.js';
 import { saveSession, type SessionData } from './session.js';
 import {
   printToolCall,
@@ -497,6 +498,32 @@ export class Agent {
    * 然后跳出当前循环，让模型以全新上下文开始执行 plan。
    */
   private contextCleared = false;
+
+  // ── MCP 集成 ──
+  /**
+   * MCP 管理器实例
+   *
+   * 负责外部 MCP 服务器的连接、工具发现和调用路由。
+   * 在 Agent 构造时创建（轻量，不做 I/O），
+   * 实际连接在首次 chat() 调用时懒执行。
+   */
+  private mcpManager = new McpManager();
+  /**
+   * MCP 初始化标志
+   *
+   * 确保 loadAndConnect() 只在首次 chat() 调用时执行一次。
+   * 即使初始化失败（try/catch），也会置为 true 避免重复尝试。
+   */
+  private mcpInitialized = false;
+  /**
+   * MCP 工具定义缓存
+   *
+   * 服务器连接后缓存所有 MCP 工具的 Anthropic Tool 定义，
+   * 在每次 callApi() 时与内置工具合并发送给模型。
+   * 未配置 MCP 服务器时为空数组，不影响现有行为。
+   */
+  private mcpTools: Anthropic.Tool[] = [];
+
   /**
    * Plan 审批回调
    *
@@ -760,6 +787,20 @@ export class Agent {
     this.abortController = new AbortController();
 
     try {
+      // 懒初始化 MCP 服务器连接（仅首次 chat 调用时执行）
+      // 放在 chat() 而非构造函数中，因为 MCP 连接是异步的，
+      // 构造函数不支持 async。首次调用后 mcpInitialized 标志防止重复连接。
+      if (!this.mcpInitialized) {
+        this.mcpInitialized = true;
+        try {
+          await this.mcpManager.loadAndConnect();
+          this.mcpTools = this.mcpManager.getToolDefinitions() as Anthropic.Tool[];
+        } catch (err: any) {
+          // MCP 初始化失败不应阻塞 Agent 主流程
+          console.error(`[mcp] Initialization failed: ${err.message}`);
+        }
+      }
+
       await this.checkAndCompact();
 
       while (true) {
@@ -823,6 +864,46 @@ export class Agent {
               tool_use_id: toolUse.id,
               content: result,
             });
+            continue;
+          }
+
+          // MCP 工具路由：检测 mcp__ 前缀的工具名，转发到对应的 MCP 服务器
+          // MCP 调用是异步的（通过子进程 JSON-RPC 通信），
+          // 独立于同步的内置工具系统，避免将整个工具系统改为异步
+          if (this.mcpManager.isMcpTool(toolUse.name)) {
+            // Plan 模式下禁止 MCP 工具调用（plan 模式是只读的）
+            if (this.permissionMode === 'plan') {
+              printDenied(this.permissionMode);
+              toolResults.push({
+                type: 'tool_result',
+                tool_use_id: toolUse.id,
+                content: 'Action denied by permission mode.',
+              });
+              continue;
+            }
+
+            try {
+              const mcpResult = await this.mcpManager.callTool(
+                toolUse.name,
+                input,
+              );
+              const result = this.persistLargeResult(toolUse.name, mcpResult);
+              printToolResult(toolUse.name, result);
+              toolResults.push({
+                type: 'tool_result',
+                tool_use_id: toolUse.id,
+                content: result,
+              });
+            } catch (err: any) {
+              const errorMsg = `MCP tool error: ${err.message}`;
+              printToolResult(toolUse.name, errorMsg);
+              toolResults.push({
+                type: 'tool_result',
+                tool_use_id: toolUse.id,
+                content: errorMsg,
+                is_error: true,
+              });
+            }
             continue;
           }
 
@@ -947,7 +1028,7 @@ export class Agent {
           model: this.model,
           max_tokens: thinkingEnabled ? maxOutput : 16384,
           system: this.systemPrompt,
-          tools: toolDefinitions,
+          tools: [...toolDefinitions, ...this.mcpTools],
           messages: this.messages,
           // thinking 参数：budget_tokens 必须严格小于 max_tokens（API 约束）
           ...(thinkingEnabled && {

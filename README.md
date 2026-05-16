@@ -140,6 +140,46 @@ coding-agent --thinking "分析这段代码的性能瓶颈"
 coding-agent --thinking --yolo "重构这个函数并解释你的推理过程"
 ```
 
+### MCP 集成（外部工具扩展）
+
+通过 MCP（Model Context Protocol）协议接入外部工具生态，让 Agent 能力不再局限于内置工具。
+
+**配置方式：** 在项目根目录创建 `.mcp.json`，或在 `.claude/settings.json` 中添加 `mcpServers` 字段：
+
+```json
+{
+  "mcpServers": {
+    "filesystem": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"]
+    },
+    "github": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-github"],
+      "env": { "GITHUB_TOKEN": "ghp_xxx" }
+    }
+  }
+}
+```
+
+| 特性 | 说明 |
+|------|------|
+| 协议 | JSON-RPC 2.0 over stdio，零 SDK 依赖 |
+| 懒加载 | 首次 `chat()` 调用时才连接服务器 |
+| 工具命名 | `mcp__<serverName>__<toolName>` 避免与内置工具冲突 |
+| 优雅降级 | 单个服务器失败不影响其他服务器和内置工具 |
+| 超时保护 | 初始化和工具发现均有 15 秒超时 |
+| 权限控制 | Plan 模式下禁止调用 MCP 工具（只读保护） |
+| 配置来源 | `~/.claude/settings.json` → `.claude/settings.json` → `.mcp.json`（优先级递增） |
+
+```bash
+# 启动后自动连接配置的 MCP 服务器
+coding-agent
+# 控制台显示：[mcp] Connected to 'github' — 12 tools
+```
+
+详细设计文档见 [docs/mcp.md](docs/mcp.md)。
+
 ### API 容错
 
 | 功能 | 说明 |
@@ -183,6 +223,7 @@ coding-agent/
 ├── src/
 │   ├── index.ts              # CLI 入口：参数解析、REPL 循环、.env 配置加载
 │   ├── agent.ts              # 核心引擎：Agent Loop、流式响应、上下文压缩
+│   ├── mcp.ts                # MCP 客户端：JSON-RPC over stdio，工具发现和路由
 │   └── tools/
 │       ├── index.ts           # 工具注册表和路由器
 │       ├── types.ts           # ToolDefinition 接口定义
@@ -198,7 +239,8 @@ coding-agent/
 │           └── plan-mode.ts    # Plan Mode 工具（enter/exit_plan_mode）
 ├── docs/
 │   ├── context-management-design.md  # 上下文管理设计文档
-│   └── plan-mode.md                  # Plan Mode 设计文档
+│   ├── plan-mode.md                  # Plan Mode 设计文档
+│   └── mcp.md                        # MCP 集成设计文档
 ├── package.json
 ├── tsconfig.json
 └── .env                       # API_KEY, API_BASE_URL, MODEL

@@ -1,0 +1,16 @@
+{
+  "mcpServers": {
+    "test": {
+      "command": "node",
+      "args": ["test/mcp-server.cjs"]
+    },
+    "everything": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-everything"]
+    },
+    "context7": {
+      "command": "npx",
+      "args": ["-y", "@upstash/context7-mcp"]
+    }
+  }
+}
