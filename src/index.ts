@@ -20,6 +20,8 @@ import {
   printUserPrompt,
   printError,
   printInfo,
+  printPlanForApproval,
+  printPlanApprovalOptions,
 } from './ui.js';
 
 /**
@@ -226,6 +228,38 @@ async function runRepl(agent: Agent): Promise<void> {
     });
   });
 
+  // 提供 planApprovalFn，展示 plan 内容并收集用户审批决定
+  agent.setPlanApprovalFn((planContent: string) => {
+    return new Promise((resolve) => {
+      printPlanForApproval(planContent);
+      printPlanApprovalOptions();
+
+      const askChoice = (): void => {
+        rl.question('  Enter choice (1-4): ', (answer) => {
+          const choice = answer.trim();
+          if (choice === '1') {
+            resolve({ choice: 'clear-and-execute' });
+          } else if (choice === '2') {
+            resolve({ choice: 'execute' });
+          } else if (choice === '3') {
+            resolve({ choice: 'manual-execute' });
+          } else if (choice === '4') {
+            rl.question('  Feedback (what to change): ', (feedback) => {
+              resolve({
+                choice: 'keep-planning',
+                feedback: feedback.trim() || undefined,
+              });
+            });
+          } else {
+            console.log('  Invalid choice. Enter 1, 2, 3, or 4.');
+            askChoice();
+          }
+        });
+      };
+      askChoice();
+    });
+  });
+
   let sigintCount = 0;
   let isProcessing = false;
 
@@ -293,9 +327,7 @@ async function runRepl(agent: Agent): Promise<void> {
       }
 
       if (input === '/plan') {
-        // 切换规划模式（只读 ↔ 正常）
-        // TODO: 接入 Agent 后调用 agent.togglePlanMode()
-        printInfo('Plan mode toggled. (not yet implemented)');
+        agent.togglePlanMode();
         askQuestion();
         return;
       }

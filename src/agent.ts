@@ -21,7 +21,7 @@
  */
 
 import Anthropic from '@anthropic-ai/sdk';
-import { mkdirSync, writeFileSync } from 'fs';
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'fs';
 import { join } from 'path';
 import { homedir } from 'os';
 import { randomUUID } from 'crypto';
@@ -465,6 +465,54 @@ export class Agent {
    */
   private abortController: AbortController | null = null;
 
+  // ── Plan Mode 状态 ──
+  /**
+   * 进入 plan 模式前的权限模式
+   *
+   * 用于在退出 plan 模式时恢复原始权限。
+   * 为 null 表示当前不在 plan 模式中（或从 CLI --plan 启动，无需恢复）。
+   */
+  private prePlanMode: PermissionMode | null = null;
+  /**
+   * 当前 plan 文件的绝对路径
+   *
+   * plan 模式下模型唯一允许写入的文件。
+   * 路径格式：~/.coding-agent/plans/plan-{sessionId}.md
+   * 为 null 表示未处于 plan 模式。
+   */
+  private planFilePath: string | null = null;
+  /**
+   * 不含 plan 模式附加内容的基础系统提示
+   *
+   * 构造时保存一份 buildSystemPrompt() 的原始结果。
+   * 进出 plan 模式时用它作为基底，动态拼接或移除 plan 提示段。
+   */
+  private baseSystemPrompt: string;
+  /**
+   * 标记上下文已被清理（plan 审批 clear-and-execute 选项）
+   *
+   * 当用户选择"清空上下文并执行"时，消息历史被清空，
+   * 但当前工具执行循环仍在进行中。此标志告诉循环：
+   * 将 executePlanModeTool 的返回值以 user 消息注入而非 tool_result，
+   * 然后跳出当前循环，让模型以全新上下文开始执行 plan。
+   */
+  private contextCleared = false;
+  /**
+   * Plan 审批回调
+   *
+   * 由 REPL 注入（setPlanApprovalFn），在模型调用 exit_plan_mode 时触发。
+   * 展示 plan 内容并提供四个选项供用户选择。
+   * 与 confirmFn 类似，避免在 Agent 内部创建 readline 实例。
+   */
+  private planApprovalFn?: (planContent: string) => Promise<{
+    choice:
+      | 'clear-and-execute'
+      | 'execute'
+      | 'manual-execute'
+      | 'keep-planning';
+    feedback?: string;
+  }>;
+
   // ── 会话持久化 ──
   /**
    * 会话唯一标识符（8 字符 UUID 前缀）
@@ -516,8 +564,18 @@ export class Agent {
     this.thinkingMode = this.resolveThinkingMode();
     this.maxCostUsd = options.maxCostUsd;
     this.maxTurns = options.maxTurns;
-    this.systemPrompt = buildSystemPrompt();
     this.effectiveWindow = getContextWindow(this.model) - 20000;
+
+    // 保存基础系统提示，plan 模式在此基础上追加指令
+    this.baseSystemPrompt = buildSystemPrompt();
+
+    // 若通过 --plan 启动，初始化 plan 文件并追加 plan 模式提示
+    if (this.permissionMode === 'plan') {
+      this.planFilePath = this.generatePlanFilePath();
+      this.systemPrompt = this.baseSystemPrompt + this.buildPlanModePrompt();
+    } else {
+      this.systemPrompt = this.baseSystemPrompt;
+    }
   }
 
   // ─── 公开方法 ────────────────────────────────────────
@@ -530,6 +588,65 @@ export class Agent {
   /** 设置外部确认回调（由 REPL 在启动时注入） */
   setConfirmFn(fn: (message: string) => Promise<boolean>): void {
     this.confirmFn = fn;
+  }
+
+  /**
+   * 设置 Plan 审批回调（由 REPL 在启动时注入）
+   *
+   * 当模型调用 exit_plan_mode 时，Agent 通过此回调
+   * 将 plan 内容展示给用户并收集审批结果。
+   */
+  setPlanApprovalFn(
+    fn: (planContent: string) => Promise<{
+      choice:
+        | 'clear-and-execute'
+        | 'execute'
+        | 'manual-execute'
+        | 'keep-planning';
+      feedback?: string;
+    }>,
+  ): void {
+    this.planApprovalFn = fn;
+  }
+
+  /**
+   * 切换 Plan Mode（由 REPL /plan 命令调用）
+   *
+   * 行为：
+   * - 当前非 plan 模式 → 进入 plan 模式：
+   *   1. 保存当前 permissionMode 到 prePlanMode
+   *   2. 切换到 "plan" 模式
+   *   3. 生成 plan 文件路径
+   *   4. 追加 plan 模式系统提示
+   *
+   * - 当前 plan 模式 → 退出 plan 模式：
+   *   1. 恢复 prePlanMode
+   *   2. 清除 planFilePath
+   *   3. 恢复原始系统提示
+   *
+   * @returns 切换后的模式名称（供 REPL 展示）
+   */
+  togglePlanMode(): string {
+    if (this.permissionMode === 'plan') {
+      this.permissionMode = this.prePlanMode || 'default';
+      this.prePlanMode = null;
+      this.planFilePath = null;
+      this.systemPrompt = this.baseSystemPrompt;
+      printInfo(`Exited plan mode → ${this.permissionMode} mode`);
+      return this.permissionMode;
+    } else {
+      this.prePlanMode = this.permissionMode;
+      this.permissionMode = 'plan';
+      this.planFilePath = this.generatePlanFilePath();
+      this.systemPrompt = this.baseSystemPrompt + this.buildPlanModePrompt();
+      printInfo(`Entered plan mode. Plan file: ${this.planFilePath}`);
+      return 'plan';
+    }
+  }
+
+  /** 获取当前权限模式（供 REPL 展示） */
+  getPermissionMode(): string {
+    return this.permissionMode;
   }
 
   /**
@@ -676,18 +793,45 @@ export class Agent {
 
         const toolResults: Anthropic.ToolResultBlockParam[] = [];
 
+        // contextBreak 标志：当 plan 审批选择"清空上下文并执行"时，
+        // 需要跳出当前工具执行循环，让模型以全新上下文继续
+        let contextBreak = false;
+
         for (const toolUse of toolUses) {
-          // 工具执行过程中，用户停止，那么应该停止tool的使用
-          if (this.abortController.signal.aborted) break;
+          if (contextBreak || this.abortController.signal.aborted) break;
 
           const input = toolUse.input as Record<string, any>;
           printToolCall(toolUse.name, input);
 
-          // 权限检查
+          // 拦截 plan mode 工具（由 Agent 内部处理，不走常规工具路由）
+          if (
+            toolUse.name === 'enter_plan_mode' ||
+            toolUse.name === 'exit_plan_mode'
+          ) {
+            const result = await this.executePlanModeTool(toolUse.name);
+            printToolResult(toolUse.name, result);
+
+            // 处理上下文清理：将结果以 user 消息注入而非 tool_result
+            if (this.contextCleared) {
+              this.contextCleared = false;
+              this.messages.push({ role: 'user', content: result });
+              contextBreak = true;
+              break;
+            }
+            toolResults.push({
+              type: 'tool_result',
+              tool_use_id: toolUse.id,
+              content: result,
+            });
+            continue;
+          }
+
+          // 权限检查（传入 planFilePath 以支持 plan 文件白名单）
           const perm = checkPermission(
             toolUse.name,
             input,
             this.permissionMode,
+            this.planFilePath || undefined,
           );
           if (perm === 'deny') {
             printDenied(this.permissionMode);
@@ -725,7 +869,11 @@ export class Agent {
         }
 
         // 工具结果作为 user 消息加入（Anthropic API 规定）
-        this.messages.push({ role: 'user', content: toolResults });
+        // contextBreak 时结果已单独注入，不再重复添加
+        if (!contextBreak && toolResults.length > 0) {
+          this.messages.push({ role: 'user', content: toolResults });
+        }
+        this.contextCleared = false;
       }
     } finally {
       this.abortController = null;
@@ -924,6 +1072,179 @@ export class Agent {
     if (this.confirmFn) return this.confirmFn(message);
     printConfirmFallback(message);
     return false;
+  }
+
+  // ─── Plan Mode 内部方法 ─────────────────────────────
+
+  /**
+   * 生成 plan 文件路径
+   *
+   * 路径格式：~/.coding-agent/plans/plan-{sessionId}.md
+   * 每个会话有独立的 plan 文件，避免冲突。
+   */
+  private generatePlanFilePath(): string {
+    const dir = join(homedir(), '.coding-agent', 'plans');
+    mkdirSync(dir, { recursive: true });
+    return join(dir, `plan-${this.sessionId}.md`);
+  }
+
+  /**
+   * 构建 plan 模式的系统提示追加段
+   *
+   * 告诉模型：
+   * 1. 当前处于只读规划阶段
+   * 2. 唯一允许写入的文件是 plan 文件
+   * 3. 应该遵循的工作流程（探索 → 设计 → 写计划 → 退出）
+   * 4. 完成后必须调用 exit_plan_mode
+   */
+  private buildPlanModePrompt(): string {
+    return `
+
+# Plan Mode Active
+
+Plan mode is active. You MUST NOT make any edits (except the plan file below), run non-readonly tools, or make any changes to the system.
+
+## Plan File: ${this.planFilePath}
+Write your plan incrementally to this file using write_file or edit_file. This is the ONLY file you are allowed to edit.
+
+## Workflow
+1. **Explore**: Read code to understand the task. Use read_file, list_files, grep_search.
+2. **Design**: Design your implementation approach.
+3. **Write Plan**: Write a structured plan to the plan file including:
+   - **Context**: Why this change is needed
+   - **Steps**: Implementation steps with critical file paths
+   - **Verification**: How to test the changes
+4. **Exit**: Call exit_plan_mode when your plan is ready for user review.
+
+IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask the user to approve — exit_plan_mode handles that.`;
+  }
+
+  /**
+   * 执行 plan mode 工具（enter/exit）
+   *
+   * 拦截 enter_plan_mode 和 exit_plan_mode 的调用，
+   * 在 Agent 层面处理状态切换和审批流程。
+   *
+   * enter_plan_mode 流程：
+   * - 保存当前权限模式 → 切换到 plan → 生成 plan 文件 → 追加系统提示
+   * - 返回提示文本告知模型 plan 文件路径和工作流程
+   *
+   * exit_plan_mode 流程：
+   * - 读取 plan 文件内容 → 调用 planApprovalFn 获取用户选择
+   * - keep-planning: 保持 plan 模式，将用户反馈返回给模型
+   * - clear-and-execute: 清空消息历史，设置 contextCleared 标志，
+   *   权限切换到 acceptEdits
+   * - execute: 保留上下文，权限切换到 acceptEdits
+   * - manual-execute: 保留上下文，恢复原始权限模式
+   */
+  private async executePlanModeTool(name: string): Promise<string> {
+    if (name === 'enter_plan_mode') {
+      if (this.permissionMode === 'plan') {
+        return 'Already in plan mode.';
+      }
+      this.prePlanMode = this.permissionMode;
+      this.permissionMode = 'plan';
+      this.planFilePath = this.generatePlanFilePath();
+      this.systemPrompt = this.baseSystemPrompt + this.buildPlanModePrompt();
+      printInfo('Entered plan mode (read-only). Plan file: ' + this.planFilePath);
+      return (
+        `Entered plan mode. You are now in read-only mode.\n\n` +
+        `Your plan file: ${this.planFilePath}\n` +
+        `Write your plan to this file. This is the only file you can edit.\n\n` +
+        `When your plan is complete, call exit_plan_mode.`
+      );
+    }
+
+    if (name === 'exit_plan_mode') {
+      if (this.permissionMode !== 'plan') {
+        return 'Not in plan mode.';
+      }
+
+      // 读取 plan 文件内容
+      let planContent = '(No plan file found)';
+      if (this.planFilePath && existsSync(this.planFilePath)) {
+        planContent = readFileSync(this.planFilePath, 'utf-8');
+      }
+
+      // 交互式审批流程
+      if (this.planApprovalFn) {
+        const result = await this.planApprovalFn(planContent);
+
+        // 用户选择继续规划：返回反馈给模型
+        if (result.choice === 'keep-planning') {
+          const feedback = result.feedback || 'Please revise the plan.';
+          return (
+            `User rejected the plan and wants to keep planning.\n\n` +
+            `User feedback: ${feedback}\n\n` +
+            `Please revise your plan based on this feedback. When done, call exit_plan_mode again.`
+          );
+        }
+
+        // 用户批准：确定目标权限模式
+        let targetMode: PermissionMode;
+        if (result.choice === 'clear-and-execute' || result.choice === 'execute') {
+          targetMode = 'acceptEdits';
+        } else {
+          // manual-execute: 恢复进入 plan 前的原始权限模式
+          targetMode = this.prePlanMode || 'default';
+        }
+
+        // 退出 plan 模式
+        this.permissionMode = targetMode;
+        this.prePlanMode = null;
+        const savedPlanPath = this.planFilePath;
+        this.planFilePath = null;
+        this.systemPrompt = this.baseSystemPrompt;
+
+        // 清空上下文并执行：消息历史清空，plan 内容作为新的起点
+        if (result.choice === 'clear-and-execute') {
+          this.clearHistoryKeepSystem();
+          this.contextCleared = true;
+          printInfo(`Plan approved. Context cleared, executing in ${targetMode} mode.`);
+          return (
+            `User approved the plan. Context was cleared. Permission mode: ${targetMode}\n\n` +
+            `Plan file: ${savedPlanPath}\n\n` +
+            `## Approved Plan:\n${planContent}\n\n` +
+            `Proceed with implementation.`
+          );
+        }
+
+        printInfo(`Plan approved. Executing in ${targetMode} mode.`);
+        return (
+          `User approved the plan. Permission mode: ${targetMode}\n\n` +
+          `## Approved Plan:\n${planContent}\n\n` +
+          `Proceed with implementation.`
+        );
+      }
+
+      // 回退：无审批回调时直接退出 plan 模式（如非交互模式）
+      this.permissionMode = this.prePlanMode || 'default';
+      this.prePlanMode = null;
+      this.planFilePath = null;
+      this.systemPrompt = this.baseSystemPrompt;
+      printInfo('Exited plan mode. Restored to ' + this.permissionMode + ' mode.');
+      return (
+        `Exited plan mode. Permission mode restored to: ${this.permissionMode}\n\n` +
+        `## Your Plan:\n${planContent}`
+      );
+    }
+
+    return `Unknown plan mode tool: ${name}`;
+  }
+
+  /**
+   * 清理消息历史但保留系统提示
+   *
+   * 用于 plan 审批的"清空上下文并执行"选项。
+   * 清空 messages 数组和 lastInputTokenCount，
+   * 让模型以全新的上下文开始执行 plan。
+   *
+   * 注意：Anthropic API 的 system prompt 不在 messages 数组中，
+   * 所以清空 messages 不会影响系统提示。
+   */
+  private clearHistoryKeepSystem(): void {
+    this.messages = [];
+    this.lastInputTokenCount = 0;
   }
 
   // ─── 上下文压缩管道 ─────────────────────────────────

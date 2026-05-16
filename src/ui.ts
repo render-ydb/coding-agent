@@ -353,6 +353,57 @@ export function printThinkingEnd(): void {
 }
 
 // ─────────────────────────────────────────────────────────
+// Plan Mode 审批展示
+// ─────────────────────────────────────────────────────────
+
+/**
+ * 展示 Plan 文件内容供用户审批
+ *
+ * 最多展示 60 行，超出部分显示剩余行数提示。
+ * 使用分隔线框定内容区域，视觉上与对话流区分开。
+ *
+ * @param planContent plan 文件的完整内容
+ */
+export function printPlanForApproval(planContent: string): void {
+  console.log('\n  ━━━ Plan for Approval ━━━');
+  const lines = planContent.split('\n');
+  const maxLines = 60;
+  const display = lines.slice(0, maxLines);
+  for (const line of display) {
+    console.log('  ' + line);
+  }
+  if (lines.length > maxLines) {
+    console.log(`  ... (${lines.length - maxLines} more lines)`);
+  }
+  console.log('  ━━━━━━━━━━━━━━━━━━━━━━━━\n');
+}
+
+/**
+ * 展示 Plan 审批选项
+ *
+ * 四个选项对应不同的后续行为：
+ * 1. 清空上下文 + 自动批准编辑 → 干净的执行环境，避免旧上下文干扰
+ * 2. 保留上下文 + 自动批准编辑 → 保持对话连贯性
+ * 3. 保留上下文 + 手动审批 → 最安全，每个编辑需确认
+ * 4. 继续规划 → 提供反馈让模型修改 plan
+ */
+export function printPlanApprovalOptions(): void {
+  console.log('  Choose an option:');
+  console.log(
+    '    1) Yes, clear context and execute — fresh start with auto-accept edits',
+  );
+  console.log(
+    '    2) Yes, and execute              — keep context, auto-accept edits',
+  );
+  console.log(
+    '    3) Yes, manually approve edits   — keep context, confirm each edit',
+  );
+  console.log(
+    '    4) No, keep planning             — provide feedback to revise',
+  );
+}
+
+// ─────────────────────────────────────────────────────────
 // Spinner（加载动画）
 // ─────────────────────────────────────────────────────────
 

@@ -63,10 +63,50 @@ npm run build && npm start
 | `default` | *(无)* | 危险命令和新文件写入需要用户确认 |
 | `bypassPermissions` | `--yolo` / `-y` | 跳过所有确认提示 |
 | `acceptEdits` | `--accept-edits` | 自动批准文件编辑，危险 shell 命令仍需确认 |
-| `plan` | `--plan` | 只读模式，拒绝所有写操作 |
+| `plan` | `--plan` | 规划模式：只读 + 写 plan 文件，支持交互式审批后执行 |
 | `dontAsk` | `--dont-ask` | 自动拒绝所有需要确认的操作（CI 模式） |
 
 危险命令检测覆盖：`rm`、`git push/reset/clean`、`sudo`、`mkfs`、`dd`、`kill`、`reboot`、`shutdown`，以及 Windows 等价命令（`del`、`rmdir`、`format`、`taskkill`、`Remove-Item`、`Stop-Process`）。
+
+### Plan Mode（规划模式）
+
+让 Agent 在修改代码之前先制定方案，用户审批通过后再执行。核心理念：**先想清楚再动手**。
+
+**三种进入方式：**
+
+```bash
+# 1. CLI 参数启动
+coding-agent --plan "重构 auth 模块"
+
+# 2. REPL 中切换
+> /plan                    # 进入 plan 模式
+> 帮我优化数据库查询
+> ...模型读代码、写计划...
+> /plan                    # 退出 plan 模式
+
+# 3. 模型自主调用 enter_plan_mode 工具
+```
+
+**生命周期：**
+
+```
+进入 Plan Mode → 只读探索代码 → 写 plan 文件 → exit_plan_mode → 用户审批 → 执行
+                                                        ↑                    │
+                                                        └── 反馈修改 ←────────┘
+```
+
+**审批选项（模型调用 `exit_plan_mode` 后触发）：**
+
+| 选项 | 行为 |
+|------|------|
+| 1. 清空上下文并执行 | 清空历史消息，以 plan 为起点开始执行，自动批准编辑 |
+| 2. 保留上下文并执行 | 保持对话连贯，自动批准编辑 |
+| 3. 手动审批每个编辑 | 保持对话连贯，每个文件修改需用户确认 |
+| 4. 继续规划 | 提供反馈文本，模型修改 plan 后再次提交 |
+
+**Plan 文件存储位置：** `~/.coding-agent/plans/plan-{sessionId}.md`
+
+详细设计文档见 [docs/plan-mode.md](docs/plan-mode.md)。
 
 ### 上下文管理（5 层递进压缩管道）
 
@@ -116,6 +156,7 @@ coding-agent --thinking --yolo "重构这个函数并解释你的推理过程"
 | 交互式 REPL | 基于 readline 的持久对话循环 |
 | 单次模式 | 通过参数传入 prompt：`coding-agent "修复这个 bug"` |
 | `/clear` | 清空对话历史 |
+| `/plan` | 切换 Plan Mode（只读规划 ↔ 正常模式） |
 | `/cost` | 显示 token 用量和估算费用 |
 | `/compact` | 手动触发对话压缩 |
 | 双次 Ctrl+C | 第一次中断当前请求，第二次退出程序 |
@@ -152,10 +193,12 @@ coding-agent/
 │           ├── write-file.ts  # 写入文件
 │           ├── edit-file.ts   # 编辑文件
 │           ├── list-files.ts  # 列出文件
-│           ├── grep-search.ts # 搜索文件
-│           └── run-shell.ts   # 执行命令
+│           ├── grep-search.ts  # 搜索文件
+│           ├── run-shell.ts    # 执行命令
+│           └── plan-mode.ts    # Plan Mode 工具（enter/exit_plan_mode）
 ├── docs/
-│   └── context-management-design.md  # 上下文管理设计文档
+│   ├── context-management-design.md  # 上下文管理设计文档
+│   └── plan-mode.md                  # Plan Mode 设计文档
 ├── package.json
 ├── tsconfig.json
 └── .env                       # API_KEY, API_BASE_URL, MODEL

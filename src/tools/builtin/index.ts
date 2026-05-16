@@ -14,12 +14,13 @@ import { editFile } from './edit-file.js';
 import { listFiles } from './list-files.js';
 import { grepSearch } from './grep-search.js';
 import { runShell } from './run-shell.js';
+import { enterPlanMode, exitPlanMode } from './plan-mode.js';
 
 /**
  * 所有内置工具的有序数组
  *
  * 顺序决定了工具在 API 请求中的排列位置。
- * 读操作在前、写操作在后，是一种约定（不影响功能）。
+ * 读操作在前、写操作在后，Plan Mode 工具在最后。
  */
 export const builtinTools: ToolDefinition[] = [
   readFile,
@@ -28,4 +29,6 @@ export const builtinTools: ToolDefinition[] = [
   listFiles,
   grepSearch,
   runShell,
+  enterPlanMode,
+  exitPlanMode,
 ];

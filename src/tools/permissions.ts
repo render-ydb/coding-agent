@@ -79,6 +79,9 @@ const READ_ONLY_TOOLS = new Set(['read_file', 'list_files', 'grep_search']);
 /** 编辑工具集合 —— 在 acceptEdits 模式下自动批准 */
 const EDIT_TOOLS = new Set(['write_file', 'edit_file']);
 
+/** Plan mode 专属工具 —— 始终允许执行（由 Agent 内部拦截处理） */
+const PLAN_MODE_TOOLS = new Set(['enter_plan_mode', 'exit_plan_mode']);
+
 /**
  * 统一权限检查函数
  *
@@ -90,22 +93,39 @@ const EDIT_TOOLS = new Set(['write_file', 'edit_file']);
  * 检查优先级（从高到低）：
  * 1. bypassPermissions 模式 → 全部放行
  * 2. 读操作 → 始终放行（读文件不会造成破坏）
- * 3. plan 模式 → 拒绝所有非读操作
- * 4. acceptEdits 模式 → 放行文件编辑
- * 5. 危险 shell 命令 → 需确认（dontAsk 模式下直接拒绝）
- * 6. 新文件写入 → 需确认
- * 7. 其他 → 放行
+ * 3. plan mode 工具 → 始终放行（enter/exit_plan_mode）
+ * 4. plan 模式 → 仅允许写 plan 文件，拒绝其他所有写操作
+ * 5. acceptEdits 模式 → 放行文件编辑
+ * 6. 危险 shell 命令 → 需确认（dontAsk 模式下直接拒绝）
+ * 7. 新文件写入 → 需确认
+ * 8. 其他 → 放行
+ *
+ * @param toolName      工具名称
+ * @param input         工具输入参数
+ * @param mode          当前权限模式
+ * @param planFilePath  plan 模式下唯一允许写入的文件路径（可选）
  */
 export function checkPermission(
   toolName: string,
   input: Record<string, any>,
   mode: PermissionMode,
+  planFilePath?: string,
 ): 'allow' | 'confirm' | 'deny' {
   if (mode === 'bypassPermissions') return 'allow';
 
   if (READ_ONLY_TOOLS.has(toolName)) return 'allow';
 
-  if (mode === 'plan') return 'deny';
+  // plan mode 工具（enter/exit）在任何模式下都允许
+  if (PLAN_MODE_TOOLS.has(toolName)) return 'allow';
+
+  // plan 模式：仅允许编辑 plan 文件，其他写操作全部拒绝
+  if (mode === 'plan') {
+    if (EDIT_TOOLS.has(toolName)) {
+      const filePath = input.file_path || input.path;
+      if (planFilePath && filePath === planFilePath) return 'allow';
+    }
+    return 'deny';
+  }
 
   if (mode === 'acceptEdits' && EDIT_TOOLS.has(toolName)) return 'allow';
 
