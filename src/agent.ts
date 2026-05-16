@@ -32,6 +32,19 @@ import {
   type PermissionMode,
 } from './tools/index.js';
 import { saveSession, type SessionData } from './session.js';
+import {
+  printToolCall,
+  printToolResult,
+  printAssistantText,
+  printRetry,
+  printInfo,
+  printDenied,
+  printBudgetExceeded,
+  printConfirmFallback,
+  printCost,
+  startSpinner,
+  stopSpinner,
+} from './ui.js';
 
 // Re-export PermissionMode 供 index.ts 使用
 export type { PermissionMode } from './tools/index.js';
@@ -171,9 +184,7 @@ async function withRetry<T>(
       const reason = error?.status
         ? `HTTP ${error.status}`
         : error?.code || 'network error';
-      console.log(
-        `\n  ⟳ Retry ${attempt + 1}/${maxRetries} (${reason}), waiting ${(delay / 1000).toFixed(1)}s...`,
-      );
+      printRetry(attempt + 1, maxRetries, reason);
       await new Promise((r) => setTimeout(r, delay));
     }
   }
@@ -489,24 +500,18 @@ export class Agent {
     this.messages = data.messages as Anthropic.MessageParam[];
     this.sessionId = data.metadata.id;
     this.sessionStartTime = data.metadata.startTime;
-    console.log(
-      `\n  ℹ Session restored: ${data.metadata.id} (${data.metadata.messageCount} messages)`,
+    printInfo(
+      `Session restored: ${data.metadata.id} (${data.metadata.messageCount} messages)`,
     );
   }
 
   /** 显示当前 token 用量和估算费用 */
   showCost(): void {
-    const costIn = (this.totalInputTokens / 1_000_000) * 3;
-    const costOut = (this.totalOutputTokens / 1_000_000) * 15;
-    const total = costIn + costOut;
-    console.log(
-      `\n  Tokens: ${this.totalInputTokens} in / ${this.totalOutputTokens} out` +
-        `\n  Cost: ~$${total.toFixed(4)}` +
-        (this.maxCostUsd ? ` / $${this.maxCostUsd} budget` : '') +
-        (this.maxTurns
-          ? ` | Turns: ${this.currentTurns}/${this.maxTurns}`
-          : ''),
-    );
+    printCost(this.totalInputTokens, this.totalOutputTokens, {
+      maxCostUsd: this.maxCostUsd,
+      maxTurns: this.maxTurns,
+      currentTurns: this.currentTurns,
+    });
   }
 
   /** 手动触发对话压缩（由 REPL /compact 命令调用） */
@@ -573,7 +578,7 @@ export class Agent {
           if (this.abortController.signal.aborted) break;
 
           const input = toolUse.input as Record<string, any>;
-          this.printToolCall(toolUse.name, input);
+          printToolCall(toolUse.name, input);
 
           // 权限检查
           const perm = checkPermission(
@@ -582,7 +587,7 @@ export class Agent {
             this.permissionMode,
           );
           if (perm === 'deny') {
-            console.log(`  ✗ Denied in ${this.permissionMode} mode`);
+            printDenied(this.permissionMode);
             toolResults.push({
               type: 'tool_result',
               tool_use_id: toolUse.id,
@@ -607,7 +612,7 @@ export class Agent {
           // 执行工具，超大结果持久化到磁盘
           const raw = executeTool(toolUse.name, input);
           const result = this.persistLargeResult(toolUse.name, raw);
-          this.printToolResult(toolUse.name, result);
+          printToolResult(toolUse.name, result);
 
           toolResults.push({
             type: 'tool_result',
@@ -683,14 +688,14 @@ export class Agent {
       let firstText = true;
       stream.on('text', (text: string) => {
         if (firstText) {
-          process.stdout.write('\n');
+          printAssistantText('\n');
           firstText = false;
         }
-        process.stdout.write(text);
+        printAssistantText(text);
       });
 
       const finalMessage = await stream.finalMessage();
-      if (!firstText) process.stdout.write('\n');
+      if (!firstText) printAssistantText('\n');
 
       return finalMessage;
     }, this.abortController?.signal);
@@ -723,7 +728,7 @@ export class Agent {
 
   private isBudgetExceeded(): boolean {
     if (this.maxTurns && this.currentTurns >= this.maxTurns) {
-      console.log(`\n  ⚠ Turn limit reached (${this.maxTurns})`);
+      printBudgetExceeded(`Turn limit reached (${this.maxTurns})`);
       return true;
     }
     if (this.maxCostUsd) {
@@ -742,7 +747,7 @@ export class Agent {
       const cost =
         (this.totalInputTokens / 1e6) * 3 + (this.totalOutputTokens / 1e6) * 15;
       if (cost >= this.maxCostUsd) {
-        console.log(`\n  ⚠ Cost limit reached ($${cost.toFixed(4)})`);
+        printBudgetExceeded(`Cost limit reached ($${cost.toFixed(4)})`);
         return true;
       }
     }
@@ -751,38 +756,10 @@ export class Agent {
 
   private async confirm(message: string): Promise<boolean> {
     if (this.confirmFn) return this.confirmFn(message);
-    console.log(`  ⚠ ${message} — auto-denied (no confirm handler)`);
+    printConfirmFallback(message);
     return false;
   }
 
-  private printToolCall(name: string, input: Record<string, any>): void {
-    let summary: string;
-
-    switch (name) {
-      case 'run_shell':
-        summary = input.command;
-        break;
-      case 'read_file':
-      case 'write_file':
-      case 'edit_file':
-        summary = input.file_path;
-        break;
-      case 'grep_search':
-        summary = `"${input.pattern}"${input.path ? ` in ${input.path}` : ''}`;
-        break;
-      default:
-        summary = JSON.stringify(input).slice(0, 80);
-    }
-
-    console.log(`\n  ▶ ${name}: ${summary}`);
-  }
-
-  private printToolResult(name: string, result: string): void {
-    const lines = result.split('\n');
-    const preview = lines.slice(0, 5).join('\n');
-    const more = lines.length > 5 ? `\n    ... (${lines.length} lines)` : '';
-    console.log(`  ◀ ${name}:\n    ${preview.replace(/\n/g, '\n    ')}${more}`);
-  }
 
   // ─── 上下文压缩管道 ─────────────────────────────────
 
@@ -1011,9 +988,7 @@ export class Agent {
    */
   private async checkAndCompact(): Promise<void> {
     if (this.lastInputTokenCount > this.effectiveWindow * 0.85) {
-      console.log(
-        '\n  ℹ Context window filling up, compacting conversation...',
-      );
+      printInfo('Context window filling up, compacting conversation...');
       await this.compactConversation();
     }
   }
@@ -1085,7 +1060,7 @@ export class Agent {
     // 把当前轮的 user 输入追加回去
     if (lastUserMsg.role === 'user') this.messages.push(lastUserMsg);
     this.lastInputTokenCount = 0;
-    console.log('  ℹ Conversation compacted.');
+    printInfo('Conversation compacted.');
   }
 
   /**

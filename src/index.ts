@@ -14,6 +14,13 @@ import * as readline from 'node:readline';
 import 'dotenv/config';
 import { Agent, type PermissionMode } from './agent.js';
 import { getLatestSessionId, loadSession } from './session.js';
+import {
+  printHelp,
+  printWelcome,
+  printUserPrompt,
+  printError,
+  printInfo,
+} from './ui.js';
 
 /**
  * 命令行参数解析结果
@@ -146,52 +153,6 @@ function parseArgs(): ParsedArgs {
 }
 
 // ─────────────────────────────────────────────────────────
-// 帮助信息
-// ─────────────────────────────────────────────────────────
-
-/**
- * 打印 CLI 帮助信息
- *
- * 包含所有可用选项、REPL 命令和使用示例。
- * 格式参考常见 CLI 工具的帮助输出风格。
- */
-function printHelp(): void {
-  console.log(`
-Usage: coding-agent [options] [prompt]
-
-Options:
-  --yolo, -y          Skip all confirmation prompts (bypass permissions)
-  --plan              Plan mode: read-only, describe changes without executing
-  --accept-edits      Auto-approve file edits, still confirm dangerous shell
-  --dont-ask          Auto-deny anything needing confirmation (for CI)
-  --thinking          Enable extended thinking (Anthropic Claude only)
-  --resume            Resume the last session
-  --max-cost <usd>    Stop when estimated cost exceeds this amount
-  --max-turns <n>     Stop after N agentic turns
-  --help, -h          Show this help
-  --version, -v       Show version number
-
-REPL commands:
-  /clear              Clear conversation history
-  /plan               Toggle plan mode (read-only <-> normal)
-  /cost               Show token usage and cost
-  /compact            Manually compact conversation
-  /memory             List saved memories
-  /skills             List available skills
-  /<skill-name>       Invoke a skill (e.g. /commit "fix types")
-
-Examples:
-  coding-agent "fix the bug in src/app.ts"
-  coding-agent --yolo "run all tests and fix failures"
-  coding-agent --plan "how would you refactor this?"
-  coding-agent --accept-edits "add error handling to api.ts"
-  coding-agent --max-cost 0.50 --max-turns 20 "implement feature X"
-  coding-agent --resume
-  coding-agent  # starts interactive REPL
-`);
-}
-
-// ─────────────────────────────────────────────────────────
 // API 配置
 // ─────────────────────────────────────────────────────────
 
@@ -227,46 +188,6 @@ function loadApiConfig(): ApiConfig | null {
   if (!apiKey || !apiBaseUrl || !model) return null;
 
   return { apiKey, apiBaseUrl, model };
-}
-
-// ─────────────────────────────────────────────────────────
-// UI 输出辅助函数
-// ─────────────────────────────────────────────────────────
-
-/**
- * 打印欢迎信息
- *
- * 在 REPL 启动时显示，包含工具名称和可用命令提示。
- * 后续可以替换为 chalk 着色版本。
- */
-function printWelcome(): void {
-  console.log('\n  Coding Agent — An AI-powered coding assistant\n');
-  console.log("  Type your request, or 'exit' to quit.");
-  console.log('  Commands: /clear /plan /cost /compact /memory /skills\n');
-}
-
-/**
- * 打印用户输入提示符
- *
- * 使用 process.stdout.write 而非 console.log，
- * 因为我们不希望在提示符后换行（用户输入会紧跟其后）。
- */
-function printUserPrompt(): void {
-  process.stdout.write('\n> ');
-}
-
-/**
- * 打印错误信息（带前缀）
- */
-function printError(msg: string): void {
-  console.error(`\n  Error: ${msg}`);
-}
-
-/**
- * 打印信息提示（非错误）
- */
-function printInfo(msg: string): void {
-  console.log(`\n  ℹ ${msg}`);
 }
 
 // ─────────────────────────────────────────────────────────
