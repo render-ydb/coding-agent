@@ -10,9 +10,9 @@
  * 4. 在 REPL 模式中处理用户输入、内置命令（/clear, /cost 等）和信号中断（Ctrl+C）
  */
 
-import * as readline from "node:readline";
-import "dotenv/config";
-import { Agent, type PermissionMode } from "./agent.js";
+import * as readline from 'node:readline';
+import 'dotenv/config';
+import { Agent, type PermissionMode } from './agent.js';
 
 /**
  * 命令行参数解析结果
@@ -59,7 +59,7 @@ function parseArgs(): ParsedArgs {
   const args = process.argv.slice(2);
 
   // 各参数的默认值
-  let permissionMode: PermissionMode = "default";
+  let permissionMode: PermissionMode = 'default';
   let thinking = false;
   let resume = false;
   let maxCost: number | undefined;
@@ -73,54 +73,54 @@ function parseArgs(): ParsedArgs {
 
     // ── 权限模式相关 ──
     // --yolo / -y：跳过所有确认（"You Only Live Once" 模式）
-    if (arg === "--yolo" || arg === "-y") {
-      permissionMode = "bypassPermissions";
+    if (arg === '--yolo' || arg === '-y') {
+      permissionMode = 'bypassPermissions';
     }
     // --plan：进入只读规划模式，模型只能读文件和写计划
-    else if (arg === "--plan") {
-      permissionMode = "plan";
+    else if (arg === '--plan') {
+      permissionMode = 'plan';
     }
     // --accept-edits：自动批准文件编辑，但仍确认危险 shell 命令
-    else if (arg === "--accept-edits") {
-      permissionMode = "acceptEdits";
+    else if (arg === '--accept-edits') {
+      permissionMode = 'acceptEdits';
     }
     // --dont-ask：自动拒绝所有需要确认的操作（CI 模式）
-    else if (arg === "--dont-ask") {
-      permissionMode = "dontAsk";
+    else if (arg === '--dont-ask') {
+      permissionMode = 'dontAsk';
     }
 
     // ── 其他选项 ──
     // --thinking：启用扩展思考（仅 Anthropic Claude 4.x 支持）
-    else if (arg === "--thinking") {
+    else if (arg === '--thinking') {
       thinking = true;
     }
     // ── 会话管理 ──
     // --resume：恢复上一次的会话历史
-    else if (arg === "--resume") {
+    else if (arg === '--resume') {
       resume = true;
     }
 
     // ── 预算控制 ──
     // --max-cost <usd>：设定最大花费上限（美元）
-    else if (arg === "--max-cost") {
+    else if (arg === '--max-cost') {
       const v = parseFloat(args[++i]);
       if (!isNaN(v)) maxCost = v;
     }
     // --max-turns <n>：设定最大对话轮次
-    else if (arg === "--max-turns") {
+    else if (arg === '--max-turns') {
       const v = parseInt(args[++i], 10);
       if (!isNaN(v)) maxTurns = v;
     }
 
     // ── 帮助信息 ──
-    else if (arg === "--help" || arg === "-h") {
+    else if (arg === '--help' || arg === '-h') {
       printHelp();
       process.exit(0);
     }
 
     // ── 版本信息 ──
-    else if (arg === "--version" || arg === "-v") {
-      console.log("coding-agent v1.0.0");
+    else if (arg === '--version' || arg === '-v') {
+      console.log('coding-agent v1.0.0');
       process.exit(0);
     }
 
@@ -140,7 +140,7 @@ function parseArgs(): ParsedArgs {
     maxCost,
     maxTurns,
     // 如果有位置参数，用空格拼接为完整 prompt；否则为 undefined（进入 REPL 模式）
-    prompt: positional.length > 0 ? positional.join(" ") : undefined,
+    prompt: positional.length > 0 ? positional.join(' ') : undefined,
   };
 }
 
@@ -239,9 +239,9 @@ function loadApiConfig(): ApiConfig | null {
  * 后续可以替换为 chalk 着色版本。
  */
 function printWelcome(): void {
-  console.log("\n  Coding Agent — An AI-powered coding assistant\n");
+  console.log('\n  Coding Agent — An AI-powered coding assistant\n');
   console.log("  Type your request, or 'exit' to quit.");
-  console.log("  Commands: /clear /plan /cost /compact /memory /skills\n");
+  console.log('  Commands: /clear /plan /cost /compact /memory /skills\n');
 }
 
 /**
@@ -251,7 +251,7 @@ function printWelcome(): void {
  * 因为我们不希望在提示符后换行（用户输入会紧跟其后）。
  */
 function printUserPrompt(): void {
-  process.stdout.write("\n> ");
+  process.stdout.write('\n> ');
 }
 
 /**
@@ -299,7 +299,7 @@ async function runRepl(agent: Agent): Promise<void> {
   agent.setConfirmFn((message: string) => {
     return new Promise((resolve) => {
       rl.question(`  ${message} (y/n): `, (answer) => {
-        resolve(answer.toLowerCase().startsWith("y"));
+        resolve(answer.toLowerCase().startsWith('y'));
       });
     });
   });
@@ -307,10 +307,10 @@ async function runRepl(agent: Agent): Promise<void> {
   let sigintCount = 0;
   let isProcessing = false;
 
-  process.on("SIGINT", () => {
+  process.on('SIGINT', () => {
     if (isProcessing) {
       agent.abort();
-      console.log("\n  (interrupted)");
+      console.log('\n  (interrupted)');
       isProcessing = false;
       sigintCount = 0;
       printUserPrompt();
@@ -318,10 +318,10 @@ async function runRepl(agent: Agent): Promise<void> {
       // 空闲状态 → 计数，两次退出
       sigintCount++;
       if (sigintCount >= 2) {
-        console.log("\nBye!\n");
+        console.log('\nBye!\n');
         process.exit(0);
       }
-      console.log("\n  Press Ctrl+C again to exit.");
+      console.log('\n  Press Ctrl+C again to exit.');
       printUserPrompt();
     }
   });
@@ -341,7 +341,7 @@ async function runRepl(agent: Agent): Promise<void> {
     printUserPrompt();
 
     // 使用 once 而非 on，确保每次输入只触发一个回调
-    rl.once("line", async (line) => {
+    rl.once('line', async (line) => {
       const input = line.trim();
       // 重置 Ctrl+C 计数器（用户有了新的交互）
       sigintCount = 0;
@@ -353,8 +353,8 @@ async function runRepl(agent: Agent): Promise<void> {
       }
 
       // 退出命令
-      if (input === "exit" || input === "quit") {
-        console.log("\nBye!\n");
+      if (input === 'exit' || input === 'quit') {
+        console.log('\nBye!\n');
         rl.close();
         process.exit(0);
       }
@@ -363,31 +363,31 @@ async function runRepl(agent: Agent): Promise<void> {
       // 所有以 / 开头的输入先检查是否是内置命令
       // 未匹配的 / 命令会被当作普通输入传给 Agent
 
-      if (input === "/clear") {
+      if (input === '/clear') {
         agent.clearHistory();
-        printInfo("Conversation cleared.");
+        printInfo('Conversation cleared.');
         askQuestion();
         return;
       }
 
-      if (input === "/plan") {
+      if (input === '/plan') {
         // 切换规划模式（只读 ↔ 正常）
         // TODO: 接入 Agent 后调用 agent.togglePlanMode()
-        printInfo("Plan mode toggled. (not yet implemented)");
+        printInfo('Plan mode toggled. (not yet implemented)');
         askQuestion();
         return;
       }
 
-      if (input === "/cost") {
+      if (input === '/cost') {
         agent.showCost();
         askQuestion();
         return;
       }
 
-      if (input === "/compact") {
+      if (input === '/compact') {
         try {
           await agent.compact();
-          printInfo("Conversation compacted.");
+          printInfo('Conversation compacted.');
         } catch (e: unknown) {
           printError((e as Error).message);
         }
@@ -395,18 +395,20 @@ async function runRepl(agent: Agent): Promise<void> {
         return;
       }
 
-      if (input === "/memory") {
+      if (input === '/memory') {
         // 列出所有已保存的记忆
         // TODO: 接入 memory 模块后调用 listMemories()
-        printInfo("No memories saved yet.");
+        printInfo('No memories saved yet.');
         askQuestion();
         return;
       }
 
-      if (input === "/skills") {
+      if (input === '/skills') {
         // 列出所有可用的技能
         // TODO: 接入 skills 模块后调用 discoverSkills()
-        printInfo("No skills found. Add skills to .claude/skills/<name>/SKILL.md");
+        printInfo(
+          'No skills found. Add skills to .claude/skills/<name>/SKILL.md',
+        );
         askQuestion();
         return;
       }
@@ -415,10 +417,11 @@ async function runRepl(agent: Agent): Promise<void> {
       // 以 / 开头但不是内置命令的输入，尝试作为技能调用
       // 格式: /<skill-name> [args]
       // 例如: /commit "fix type errors"
-      if (input.startsWith("/")) {
-        const spaceIdx = input.indexOf(" ");
-        const cmdName = spaceIdx > 0 ? input.slice(1, spaceIdx) : input.slice(1);
-        const _cmdArgs = spaceIdx > 0 ? input.slice(spaceIdx + 1) : "";
+      if (input.startsWith('/')) {
+        const spaceIdx = input.indexOf(' ');
+        const cmdName =
+          spaceIdx > 0 ? input.slice(1, spaceIdx) : input.slice(1);
+        const _cmdArgs = spaceIdx > 0 ? input.slice(spaceIdx + 1) : '';
 
         // TODO: 接入 skills 模块后查找并执行技能
         // const skill = getSkillByName(cmdName);
@@ -436,7 +439,7 @@ async function runRepl(agent: Agent): Promise<void> {
         // 捕获 Agent 处理中的异常
         // AbortError 是用户主动中断，无需报错
         const error = e as Error;
-        if (error.name === "AbortError" || error.message?.includes("aborted")) {
+        if (error.name === 'AbortError' || error.message?.includes('aborted')) {
           // 用户主动中断，已由 SIGINT handler 处理
         } else {
           printError(error.message);
@@ -483,7 +486,7 @@ async function main(): Promise<void> {
         `  Create a .env file with:\n` +
         `    API_KEY=your-api-key\n` +
         `    API_BASE_URL=https://your-api-endpoint/v1\n` +
-        `    MODEL=your-model-name`
+        `    MODEL=your-model-name`,
     );
     process.exit(1);
   }
@@ -499,13 +502,13 @@ async function main(): Promise<void> {
 
   printInfo(
     `Config: model=${apiConfig.model}, mode=${config.permissionMode}, api=${apiConfig.apiBaseUrl}` +
-      (config.thinking ? ", thinking=on" : "") +
-      (config.maxCost ? `, budget=$${config.maxCost}` : "") +
-      (config.maxTurns ? `, maxTurns=${config.maxTurns}` : "")
+      (config.thinking ? ', thinking=on' : '') +
+      (config.maxCost ? `, budget=$${config.maxCost}` : '') +
+      (config.maxTurns ? `, maxTurns=${config.maxTurns}` : ''),
   );
 
   if (config.resume) {
-    printInfo("Session restore not yet implemented.");
+    printInfo('Session restore not yet implemented.');
   }
 
   if (config.prompt) {

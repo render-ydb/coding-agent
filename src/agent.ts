@@ -21,6 +21,9 @@
  */
 
 import Anthropic from '@anthropic-ai/sdk';
+import { mkdirSync, writeFileSync } from 'fs';
+import { join } from 'path';
+import { homedir } from 'os';
 import {
   toolDefinitions,
   executeTool,
@@ -540,8 +543,9 @@ export class Agent {
             }
           }
 
-          // 执行工具（executeTool 内部已包含结果截断）
-          const result = executeTool(toolUse.name, input);
+          // 执行工具，超大结果持久化到磁盘
+          const raw = executeTool(toolUse.name, input);
+          const result = this.persistLargeResult(toolUse.name, raw);
           this.printToolResult(toolUse.name, result);
 
           toolResults.push({
@@ -596,6 +600,29 @@ export class Agent {
   }
 
   // ─── 辅助方法 ────────────────────────────────────────
+
+  /**
+   * 大结果持久化：超过 30KB 的工具结果写入磁盘，上下文只保留预览
+   */
+  private persistLargeResult(toolName: string, result: string): string {
+    const THRESHOLD = 30 * 1024;
+    if (Buffer.byteLength(result) <= THRESHOLD) return result;
+
+    const dir = join(homedir(), '.coding-agent', 'tool-results');
+    mkdirSync(dir, { recursive: true });
+    const filename = `${Date.now()}-${toolName}.txt`;
+    const filepath = join(dir, filename);
+    writeFileSync(filepath, result);
+
+    const lines = result.split('\n');
+    const preview = lines.slice(0, 200).join('\n');
+    const sizeKB = (Buffer.byteLength(result) / 1024).toFixed(1);
+
+    return (
+      `[Result too large (${sizeKB} KB, ${lines.length} lines). Full output saved to ${filepath}. Use read_file to see the full result.]\n\n` +
+      `Preview (first 200 lines):\n${preview}`
+    );
+  }
 
   private isBudgetExceeded(): boolean {
     if (this.maxTurns && this.currentTurns >= this.maxTurns) {
