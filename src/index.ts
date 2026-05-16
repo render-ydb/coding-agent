@@ -415,6 +415,7 @@ async function main(): Promise<void> {
 
   const agent = new Agent({
     permissionMode: config.permissionMode,
+    thinking: config.thinking,
     maxCostUsd: config.maxCost,
     maxTurns: config.maxTurns,
     apiKey: apiConfig.apiKey,

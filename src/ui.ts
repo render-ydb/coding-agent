@@ -317,6 +317,42 @@ export function printConfirmFallback(message: string): void {
 }
 
 // ─────────────────────────────────────────────────────────
+// Thinking 输出
+// ─────────────────────────────────────────────────────────
+
+/**
+ * 打印思考过程的开头标记
+ *
+ * 使用 ANSI dim（\x1b[2m）显示灰色文字，与正常输出区分。
+ * 在 Extended Thinking 流式输出开始时调用。
+ */
+export function printThinkingStart(): void {
+  process.stdout.write('\x1b[2m\n  [thinking] \x1b[0m');
+}
+
+/**
+ * 流式输出思考过程文本
+ *
+ * 使用 dim 样式，逐 token 追加到 stdout。
+ * 在 thinking_delta 事件中调用。
+ *
+ * @param text 思考过程的增量文本片段
+ */
+export function printThinkingDelta(text: string): void {
+  process.stdout.write(`\x1b[2m${text}\x1b[0m`);
+}
+
+/**
+ * 打印思考过程的结束换行
+ *
+ * 在 thinking content block 结束时调用，
+ * 确保后续输出从新行开始。
+ */
+export function printThinkingEnd(): void {
+  process.stdout.write('\n');
+}
+
+// ─────────────────────────────────────────────────────────
 // Spinner（加载动画）
 // ─────────────────────────────────────────────────────────
 

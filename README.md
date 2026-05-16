@@ -43,6 +43,7 @@ npm run build && npm start
 | 中断支持 | Ctrl+C 通过 AbortController 中断正在进行的 API 请求 | `src/agent.ts` `abort()` |
 | 预算控制 | 支持最大花费（美元）和最大轮次限制，超出自动停止 | `src/agent.ts` `isBudgetExceeded()` |
 | Token 统计 | 累计输入/输出 token 计数和费用估算 | `src/agent.ts` `getTokenUsage()` |
+| Extended Thinking | 模型内部推理链，支持 adaptive/enabled 两种模式 | `src/agent.ts` `callApi()` |
 
 ### 工具系统
 
@@ -78,6 +79,26 @@ npm run build && npm start
 | Tier 4 | 自动摘要压缩 | 上下文利用率 > 85% | 通过一次 API 调用将整个对话压缩为摘要 | 1 次 API |
 
 详细设计文档见 [docs/context-management-design.md](docs/context-management-design.md)。
+
+### Extended Thinking（扩展思考）
+
+通过 `--thinking` 启用，让模型在生成最终回答前先进行内部推理。
+
+| 特性 | 说明 |
+|------|------|
+| 模型检测 | 自动识别 Claude 4.x 系列，非 Claude 模型静默降级为禁用 |
+| 思考模式 | **adaptive**（4.6 系列，按问题复杂度自动调节深度）/ **enabled**（4.x 其他版本，始终思考） |
+| 动态 max_tokens | Opus 4.6: 64K, Sonnet 4.6 / 其他 4.x: 32K, 未知模型: 16K |
+| 流式输出 | 思考过程以灰色 dim 文字实时展示（`[thinking] ...`），与正常回答视觉区分 |
+| 历史过滤 | thinking blocks 仅流式展示，不存入对话历史，避免占用上下文空间 |
+
+```bash
+# 启用扩展思考
+coding-agent --thinking "分析这段代码的性能瓶颈"
+
+# 配合其他参数使用
+coding-agent --thinking --yolo "重构这个函数并解释你的推理过程"
+```
 
 ### API 容错
 

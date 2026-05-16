@@ -42,6 +42,9 @@ import {
   printBudgetExceeded,
   printConfirmFallback,
   printCost,
+  printThinkingStart,
+  printThinkingDelta,
+  printThinkingEnd,
   startSpinner,
   stopSpinner,
 } from './ui.js';
@@ -67,6 +70,8 @@ export interface AgentOptions {
   model: string;
   /** 权限模式，默认 "default" */
   permissionMode?: PermissionMode;
+  /** 是否启用扩展思考（Extended Thinking），仅 Claude 4.x 支持 */
+  thinking?: boolean;
   /** 最大花费上限（美元），超过后自动停止 */
   maxCostUsd?: number;
   /** 最大工具执行轮次，超过后自动停止 */
@@ -225,6 +230,73 @@ function getContextWindow(model: string): number {
 }
 
 // ─────────────────────────────────────────────────────────
+// Extended Thinking 支持
+// ─────────────────────────────────────────────────────────
+
+/**
+ * 判断模型是否支持 Extended Thinking
+ *
+ * Extended Thinking 是 Anthropic Claude 4.x 系列的功能，
+ * 允许模型在生成最终回答前进行"思考"（Chain of Thought），
+ * 思考过程会以 thinking 类型的 content block 流式返回。
+ *
+ * 支持条件：
+ * - 必须是 Claude 品牌模型（包含 "claude" 关键字）
+ * - 必须是 4.x 或更高版本（排除 3.x 系列）
+ * - 非 Claude 模型（如 GPT）一律不支持
+ */
+function modelSupportsThinking(model: string): boolean {
+  const m = model.toLowerCase();
+  // 排除 Claude 3.x 系列（3-5 = 3.5, 3-7 = 3.7 等旧命名）
+  if (m.includes('claude-3-') || m.includes('3-5-') || m.includes('3-7-'))
+    return false;
+  // Claude 4.x 系列的 opus/sonnet/haiku 都支持
+  if (
+    m.includes('claude') &&
+    (m.includes('opus') || m.includes('sonnet') || m.includes('haiku'))
+  )
+    return true;
+  return false;
+}
+
+/**
+ * 判断模型是否支持 Adaptive Thinking（自适应思考）
+ *
+ * Adaptive Thinking 是 4.6 版本引入的增强特性：
+ * 模型会根据问题复杂度自动决定思考的深度和长度，
+ * 简单问题可能跳过思考，复杂问题则深入推理。
+ *
+ * 目前仅 opus-4-6 和 sonnet-4-6 支持。
+ */
+function modelSupportsAdaptiveThinking(model: string): boolean {
+  const m = model.toLowerCase();
+  return m.includes('opus-4-6') || m.includes('sonnet-4-6');
+}
+
+/**
+ * 根据模型返回最大输出 token 数
+ *
+ * 当启用 Extended Thinking 时，max_tokens 需要足够大以容纳
+ * 思考内容 + 最终回答。各模型的限制不同：
+ *
+ * - opus-4-6:   64,000 tokens（最强推理能力，需要更大空间）
+ * - sonnet-4-6: 32,000 tokens
+ * - 其他 4.x:   32,000 tokens
+ * - 未知模型:   16,384 tokens（安全保守值）
+ *
+ * thinking.budget_tokens 必须严格小于 max_tokens（API 要求），
+ * 因此实际设置为 getMaxOutputTokens() - 1。
+ */
+function getMaxOutputTokens(model: string): number {
+  const m = model.toLowerCase();
+  if (m.includes('opus-4-6')) return 64000;
+  if (m.includes('sonnet-4-6')) return 32000;
+  if (m.includes('opus-4') || m.includes('sonnet-4') || m.includes('haiku-4'))
+    return 32000;
+  return 16384;
+}
+
+// ─────────────────────────────────────────────────────────
 // 多层压缩常量
 // ─────────────────────────────────────────────────────────
 
@@ -316,6 +388,19 @@ export class Agent {
   private messages: Anthropic.MessageParam[] = [];
   /** 当前权限模式 */
   private permissionMode: PermissionMode;
+  /** 用户是否请求了扩展思考（--thinking 开关） */
+  private thinking: boolean;
+  /**
+   * 最终解析后的思考模式
+   *
+   * 三种状态：
+   * - "disabled": 不使用思考（默认，或模型不支持）
+   * - "enabled":  启用思考（Claude 4.x 非 4.6 版本）
+   * - "adaptive": 自适应思考（Claude 4.6 系列，模型自动决定思考深度）
+   *
+   * 由 resolveThinkingMode() 在构造时计算，综合用户意图和模型能力。
+   */
+  private thinkingMode: 'adaptive' | 'enabled' | 'disabled';
 
   // ── Token 统计 ──
   /** 累计输入 token 数（所有 API 调用的 input_tokens 之和），用于费用估算 */
@@ -427,6 +512,8 @@ export class Agent {
     });
     this.model = options.model;
     this.permissionMode = options.permissionMode || 'default';
+    this.thinking = options.thinking || false;
+    this.thinkingMode = this.resolveThinkingMode();
     this.maxCostUsd = options.maxCostUsd;
     this.maxTurns = options.maxTurns;
     this.systemPrompt = buildSystemPrompt();
@@ -443,6 +530,22 @@ export class Agent {
   /** 设置外部确认回调（由 REPL 在启动时注入） */
   setConfirmFn(fn: (message: string) => Promise<boolean>): void {
     this.confirmFn = fn;
+  }
+
+  /**
+   * 根据用户意图和模型能力解析最终的思考模式
+   *
+   * 优先级链：
+   * 1. 用户未请求 thinking（--thinking） → disabled
+   * 2. 模型不支持 thinking（非 Claude 4.x） → disabled
+   * 3. 模型支持 adaptive（4.6 系列） → adaptive
+   * 4. 模型支持但非 adaptive → enabled
+   */
+  private resolveThinkingMode(): 'adaptive' | 'enabled' | 'disabled' {
+    if (!this.thinking) return 'disabled';
+    if (!modelSupportsThinking(this.model)) return 'disabled';
+    if (modelSupportsAdaptiveThinking(this.model)) return 'adaptive';
+    return 'enabled';
   }
 
   /** 中断当前请求（由 REPL 的 SIGINT 处理器调用） */
@@ -671,31 +774,94 @@ export class Agent {
    * 调用 Anthropic Messages API（流式）
    *
    * 流式打印文本内容给用户，最终返回完整 Message 对象。
+   *
+   * Extended Thinking 处理：
+   * 当 thinkingMode 不为 "disabled" 时：
+   * 1. max_tokens 使用模型特定的最大值（而非固定 16384）
+   * 2. API 请求中附加 thinking 参数：{ type: "enabled", budget_tokens: maxOutput - 1 }
+   * 3. 流式事件中监听 thinking content block，实时展示思考过程（dim 样式）
+   * 4. 最终返回的 message 中过滤掉 thinking blocks，不存入对话历史
+   *
+   * 为什么不存 thinking blocks：
+   * - thinking 是模型的中间推理过程，不是对用户的回答
+   * - 存入历史会占用大量上下文空间
+   * - Anthropic API 在后续轮次中也不期望收到 thinking blocks
    */
   private async callApi(): Promise<Anthropic.Message> {
     return withRetry(async (signal) => {
+      // 根据 thinking 模式决定 max_tokens
+      const maxOutput = getMaxOutputTokens(this.model);
+      const thinkingEnabled =
+        this.thinkingMode === 'adaptive' || this.thinkingMode === 'enabled';
+
       const stream = this.client.messages.stream(
         {
           model: this.model,
-          max_tokens: 16384,
+          max_tokens: thinkingEnabled ? maxOutput : 16384,
           system: this.systemPrompt,
           tools: toolDefinitions,
           messages: this.messages,
+          // thinking 参数：budget_tokens 必须严格小于 max_tokens（API 约束）
+          ...(thinkingEnabled && {
+            thinking: {
+              type: 'enabled' as const,
+              budget_tokens: maxOutput - 1,
+            },
+          }),
         },
         { signal },
       );
 
+      // 流式输出文本内容
       let firstText = true;
       stream.on('text', (text: string) => {
         if (firstText) {
+          stopSpinner();
           printAssistantText('\n');
           firstText = false;
         }
         printAssistantText(text);
       });
 
+      // 流式输出思考过程（通过底层 streamEvent 监听）
+      // SDK 的高级 "text" 事件只覆盖 text 类型的 content block，
+      // thinking 类型的 block 需要通过 streamEvent 手动处理。
+      let inThinking = false;
+      stream.on('streamEvent' as any, (event: any) => {
+        // thinking block 开始：打印标记，进入思考状态
+        if (
+          event.type === 'content_block_start' &&
+          event.content_block?.type === 'thinking'
+        ) {
+          if (this.thinkingMode !== 'disabled') {
+            inThinking = true;
+            stopSpinner();
+            printThinkingStart();
+          }
+        }
+        // thinking 增量内容：流式输出思考文本
+        else if (
+          event.type === 'content_block_delta' &&
+          event.delta?.type === 'thinking_delta' &&
+          inThinking
+        ) {
+          printThinkingDelta(event.delta.thinking);
+        }
+
+        // content block 结束：如果在思考中，结束思考输出
+        if (event.type === 'content_block_stop' && inThinking) {
+          printThinkingEnd();
+          inThinking = false;
+        }
+      });
+
       const finalMessage = await stream.finalMessage();
       if (!firstText) printAssistantText('\n');
+
+      // 过滤掉 thinking blocks，不存入对话历史
+      (finalMessage as any).content = finalMessage.content.filter(
+        (block: any) => block.type !== 'thinking',
+      );
 
       return finalMessage;
     }, this.abortController?.signal);
@@ -759,7 +925,6 @@ export class Agent {
     printConfirmFallback(message);
     return false;
   }
-
 
   // ─── 上下文压缩管道 ─────────────────────────────────
 
