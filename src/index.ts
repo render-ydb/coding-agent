@@ -13,6 +13,7 @@
 import * as readline from 'node:readline';
 import 'dotenv/config';
 import { Agent, type PermissionMode } from './agent.js';
+import { getLatestSessionId, loadSession } from './session.js';
 
 /**
  * 命令行参数解析结果
@@ -504,11 +505,22 @@ async function main(): Promise<void> {
     `Config: model=${apiConfig.model}, mode=${config.permissionMode}, api=${apiConfig.apiBaseUrl}` +
       (config.thinking ? ', thinking=on' : '') +
       (config.maxCost ? `, budget=$${config.maxCost}` : '') +
-      (config.maxTurns ? `, maxTurns=${config.maxTurns}` : ''),
+      (config.maxTurns ? `, maxTurns=${config.maxTurns}` : '') +
+      ` | session=${agent.getSessionId()}`,
   );
 
   if (config.resume) {
-    printInfo('Session restore not yet implemented.');
+    const sessionId = getLatestSessionId();
+    if (sessionId) {
+      const sessionData = loadSession(sessionId);
+      if (sessionData) {
+        agent.restoreSession(sessionData);
+      } else {
+        printInfo(`Session ${sessionId} found but could not be loaded.`);
+      }
+    } else {
+      printInfo('No previous session found.');
+    }
   }
 
   if (config.prompt) {

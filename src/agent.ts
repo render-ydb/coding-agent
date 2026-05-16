@@ -24,12 +24,14 @@ import Anthropic from '@anthropic-ai/sdk';
 import { mkdirSync, writeFileSync } from 'fs';
 import { join } from 'path';
 import { homedir } from 'os';
+import { randomUUID } from 'crypto';
 import {
   toolDefinitions,
   executeTool,
   checkPermission,
   type PermissionMode,
 } from './tools/index.js';
+import { saveSession, type SessionData } from './session.js';
 
 // Re-export PermissionMode 供 index.ts 使用
 export type { PermissionMode } from './tools/index.js';
@@ -367,6 +369,24 @@ export class Agent {
    */
   private abortController: AbortController | null = null;
 
+  // ── 会话持久化 ──
+  /**
+   * 会话唯一标识符（8 字符 UUID 前缀）
+   *
+   * 用作会话文件名：~/.coding-agent/sessions/{sessionId}.json
+   * 取 UUID 前 8 位是为了生成足够唯一且人类可读的 ID。
+   * 在 restoreSession() 中会被覆盖为恢复会话的原始 ID，
+   * 这样后续 autoSave() 会更新同一个文件而非创建新文件。
+   */
+  private sessionId = randomUUID().slice(0, 8);
+  /**
+   * 会话创建时间（ISO 8601 格式）
+   *
+   * 用于 getLatestSessionId() 排序，找到最近的会话。
+   * 与 sessionId 一样，restoreSession() 时会恢复为原始值。
+   */
+  private sessionStartTime = new Date().toISOString();
+
   /**
    * 外部确认回调
    *
@@ -431,6 +451,47 @@ export class Agent {
     this.totalOutputTokens = 0;
     this.lastInputTokenCount = 0;
     this.lastApiCallTime = 0;
+  }
+
+  /**
+   * 获取当前会话 ID
+   *
+   * 由 REPL 用于在 Config 信息中展示会话标识，
+   * 方便用户知道当前是哪个会话（对应磁盘上的 {id}.json 文件）。
+   */
+  getSessionId(): string {
+    return this.sessionId;
+  }
+
+  /**
+   * 恢复之前保存的会话
+   *
+   * 由 CLI 的 --resume 逻辑调用，将磁盘上的 SessionData 注入到 Agent 中。
+   *
+   * 恢复的内容：
+   * - messages: 完整的对话历史（类型断言为 Anthropic.MessageParam[]）
+   * - sessionId: 覆盖当前 ID，使后续 autoSave() 更新同一文件
+   * - sessionStartTime: 保持原始时间戳，用于排序一致性
+   *
+   * 不恢复的内容（by design）：
+   * - totalInputTokens / totalOutputTokens: 从零开始计费，/cost 只显示恢复后的用量
+   * - currentTurns: 轮次计数重新开始
+   * - lastInputTokenCount: 首次 API 调用后会被正确设置
+   * - lastApiCallTime: 设为 0 表示"刚启动"，不会误触发 microcompact
+   *
+   * 这意味着恢复后的第一次 API 调用，模型会收到完整的历史消息，
+   * API 返回的 usage.input_tokens 会反映这些历史消息的实际 token 数，
+   * 从而让压缩管道能正确判断上下文利用率。
+   *
+   * @param data 从 loadSession() 获取的完整会话数据
+   */
+  restoreSession(data: SessionData): void {
+    this.messages = data.messages as Anthropic.MessageParam[];
+    this.sessionId = data.metadata.id;
+    this.sessionStartTime = data.metadata.startTime;
+    console.log(
+      `\n  ℹ Session restored: ${data.metadata.id} (${data.metadata.messageCount} messages)`,
+    );
   }
 
   /** 显示当前 token 用量和估算费用 */
@@ -560,6 +621,42 @@ export class Agent {
       }
     } finally {
       this.abortController = null;
+      this.autoSave();
+    }
+  }
+
+  // ─── 会话持久化 ─────────────────────────────────────
+
+  /**
+   * 自动保存当前会话到磁盘
+   *
+   * 在 chat() 的 finally 块中调用，确保每次对话（无论成功、失败还是被中断）
+   * 都会保存当前状态。即使用户按 Ctrl+C 中断了请求，已累积的消息也会被保存。
+   *
+   * 保存的数据结构：
+   * - metadata: 轻量级信息（id、模型、工作目录、启动时间、消息数）
+   * - messages: 完整的 Anthropic MessageParam 数组（包括 tool_use 和 tool_result）
+   *
+   * 外层 try/catch 确保磁盘错误（空间不足、权限问题等）不会中断用户的交互流程。
+   * 这是 "fire and forget" 语义 —— 持久化是锦上添花，不是核心功能。
+   *
+   * 注意：messages 是引用传递，但 saveSession() 内部通过 JSON.stringify()
+   * 做了深拷贝快照，所以后续对 messages 的修改不会影响已保存的数据。
+   */
+  private autoSave(): void {
+    try {
+      saveSession(this.sessionId, {
+        metadata: {
+          id: this.sessionId,
+          model: this.model,
+          cwd: process.cwd(),
+          startTime: this.sessionStartTime,
+          messageCount: this.messages.length,
+        },
+        messages: this.messages,
+      });
+    } catch {
+      // 持久化失败不应影响主流程
     }
   }
 
