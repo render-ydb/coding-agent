@@ -56,6 +56,7 @@ npm run build && npm start
 | `list_files` | 递归列出目录内容 | `src/tools/builtin/list-files.ts` |
 | `grep_search` | 正则表达式跨文件搜索 | `src/tools/builtin/grep-search.ts` |
 | `run_shell` | 执行 shell 命令，支持超时控制 | `src/tools/builtin/run-shell.ts` |
+| `agent` | 派生子 Agent 执行独立任务（explore/plan/general） | `src/tools/builtin/agent.ts` |
 
 ### 权限系统
 
@@ -161,6 +162,56 @@ coding-agent --plan "重构 auth 模块"
 ```
 
 详细设计文档见 [docs/memory-system.md](docs/memory-system.md)。
+
+### Sub-Agent 系统（子 Agent 任务分派）
+
+让主 Agent 派生独立的子 Agent 处理特定任务。子 Agent 拥有独立的对话上下文、专用系统提示和受限工具集，执行完毕后将文本结果返回给父 Agent。
+
+```
+┌─────────────────────────────────────────┐
+│  父 Agent (主对话)                       │
+│                                         │
+│  模型 → tool_use: agent                  │
+│         type: "explore"                  │
+│         prompt: "搜索所有 TODO 注释"      │
+│                                         │
+│  ┌──────────────────────────────────┐    │
+│  │  子 Agent (独立上下文)             │    │
+│  │  工具: read_file, list_files,    │    │
+│  │        grep_search               │    │
+│  │  执行 → 结果写入 outputBuffer    │    │
+│  └──────────┬───────────────────────┘    │
+│             │                            │
+│  tool_result ← outputBuffer.join("")     │
+│  token 用量 ← 累加到父 Agent              │
+└─────────────────────────────────────────┘
+```
+
+**三种内置类型：**
+
+| 类型 | 工具集 | 适用场景 |
+|------|-------|---------|
+| `explore` | read_file, list_files, grep_search | 快速搜索定位代码、文件、符号 |
+| `plan` | read_file, list_files, grep_search | 结构化分析、方案设计、架构决策 |
+| `general` | 所有工具（排除 agent） | 通用任务执行，包括文件编辑和命令运行 |
+
+**关键设计：**
+
+| 特性 | 说明 |
+|------|------|
+| 递归防护 | 子 Agent 工具集排除 `agent` 工具，无法派生孙 Agent |
+| 输出捕获 | 子 Agent 文本通过 `outputBuffer` 捕获，不直接打印到 stdout |
+| Token 累加 | 子 Agent 的 token 用量累加到父 Agent 统计，`/cost` 反映真实总量 |
+| 行为差异 | 子 Agent 跳过 MCP 初始化、memory prefetch、spinner、autoSave |
+| 权限继承 | 父 Agent plan 模式 → 子 Agent 也 plan；其他模式 → 子 Agent bypassPermissions |
+
+```bash
+# 模型自主决定何时使用子 Agent，例如：
+> 帮我搜索项目中所有的 TODO 注释并整理成列表
+# 模型可能会调用 agent(type="explore") 来搜索，然后整理结果
+```
+
+详细设计文档见 [docs/sub-agent-system.md](docs/sub-agent-system.md)。
 
 ### 上下文管理（5 层递进压缩管道）
 
@@ -296,7 +347,8 @@ coding-agent
 coding-agent/
 ├── src/
 │   ├── index.ts              # CLI 入口：参数解析、REPL 循环、.env 配置加载
-│   ├── agent.ts              # 核心引擎：Agent Loop、流式响应、上下文压缩、记忆集成
+│   ├── agent.ts              # 核心引擎：Agent Loop、流式响应、上下文压缩、Sub-Agent
+│   ├── subagent.ts           # Sub-Agent 配置：类型定义、系统提示、工具集过滤
 │   ├── memory.ts             # 记忆系统：CRUD、语义召回、预取、系统提示
 │   ├── frontmatter.ts        # YAML frontmatter 解析器（被 memory.ts 依赖）
 │   ├── session.ts            # 会话持久化：save/load/list
@@ -314,8 +366,10 @@ coding-agent/
 │           ├── list-files.ts  # 列出文件
 │           ├── grep-search.ts  # 搜索文件
 │           ├── run-shell.ts    # 执行命令
+│           ├── agent.ts        # Sub-Agent 工具（派生子 Agent）
 │           └── plan-mode.ts    # Plan Mode 工具（enter/exit_plan_mode）
 ├── docs/
+│   ├── sub-agent-system.md            # Sub-Agent 系统设计文档
 │   ├── memory-system.md              # Memory 语义召回设计文档
 │   ├── context-management-design.md  # 上下文管理设计文档
 │   ├── plan-mode.md                  # Plan Mode 设计文档
