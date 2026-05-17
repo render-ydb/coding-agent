@@ -55,9 +55,12 @@ import {
   printThinkingStart,
   printThinkingDelta,
   printThinkingEnd,
+  printSubAgentStart,
+  printSubAgentEnd,
   startSpinner,
   stopSpinner,
 } from './ui.js';
+import { getSubAgentConfig, type SubAgentType } from './subagent.js';
 
 // Re-export PermissionMode 供 index.ts 使用
 export type { PermissionMode } from './tools/index.js';
@@ -85,6 +88,7 @@ interface StreamedToolUseBlock {
  * Agent 构造参数
  *
  * 由 CLI 入口（index.ts）解析 .env 和命令行参数后传入。
+ * 子 Agent 通过 customSystemPrompt + customTools + isSubAgent 配置。
  */
 export interface AgentOptions {
   /** API 密钥（用于认证） */
@@ -101,6 +105,12 @@ export interface AgentOptions {
   maxCostUsd?: number;
   /** 最大工具执行轮次，超过后自动停止 */
   maxTurns?: number;
+  /** 子 Agent 自定义系统提示（覆盖默认 buildSystemPrompt） */
+  customSystemPrompt?: string;
+  /** 子 Agent 自定义工具集（覆盖默认 toolDefinitions） */
+  customTools?: Anthropic.Tool[];
+  /** 标记为子 Agent（跳过 MCP 初始化、memory prefetch、autoSave） */
+  isSubAgent?: boolean;
 }
 
 // ─────────────────────────────────────────────────────────
@@ -622,6 +632,35 @@ export class Agent {
     feedback?: string;
   }>;
 
+  // ── Sub-Agent 支持 ──
+  /**
+   * 标记当前实例是否为子 Agent
+   *
+   * 子 Agent 的行为差异：
+   * - 跳过 MCP 服务器初始化（使用父 Agent 传入的工具集）
+   * - 跳过 memory prefetch（不需要独立的记忆召回）
+   * - 跳过 autoSave（不需要持久化短暂的子任务会话）
+   * - 跳过 spinner（避免与父 Agent 的输出冲突）
+   * - 文本输出到 outputBuffer 而非 stdout
+   */
+  private isSubAgent: boolean;
+  /**
+   * 子 Agent 的文本捕获缓冲区
+   *
+   * 非 null 时，emitText() 将文本 push 到此数组而非 printAssistantText()。
+   * 在 runOnce() 中设置为 []，完成后 join 为最终文本结果。
+   * 正常模式（非子 Agent）下始终为 null。
+   */
+  private outputBuffer: string[] | null = null;
+  /**
+   * 子 Agent 的自定义工具集
+   *
+   * 非 null 时覆盖默认的 toolDefinitions，
+   * 用于限制子 Agent 可使用的工具（如 explore 类型只有只读工具）。
+   * 正常模式下为 null，使用全局 toolDefinitions。
+   */
+  private customTools: Anthropic.Tool[] | null = null;
+
   // ── 会话持久化 ──
   /**
    * 会话唯一标识符（8 字符 UUID 前缀）
@@ -674,17 +713,24 @@ export class Agent {
     this.maxCostUsd = options.maxCostUsd;
     this.maxTurns = options.maxTurns;
     this.effectiveWindow = getContextWindow(this.model) - 20000;
+    this.isSubAgent = options.isSubAgent || false;
+    this.customTools = options.customTools || null;
 
-    // 保存基础系统提示，包含记忆系统指令段落，plan 模式在此基础上追加指令
-    this.baseSystemPrompt =
-      buildSystemPrompt() + '\n\n' + buildMemoryPromptSection();
-
-    // 若通过 --plan 启动，初始化 plan 文件并追加 plan 模式提示
-    if (this.permissionMode === 'plan') {
-      this.planFilePath = this.generatePlanFilePath();
-      this.systemPrompt = this.baseSystemPrompt + this.buildPlanModePrompt();
-    } else {
+    // 子 Agent 使用自定义系统提示，不包含 memory 指令和 plan 模式
+    // 父 Agent 使用默认系统提示 + memory 指令，可选追加 plan 模式指令
+    if (this.isSubAgent && options.customSystemPrompt) {
+      this.baseSystemPrompt = options.customSystemPrompt;
       this.systemPrompt = this.baseSystemPrompt;
+    } else {
+      this.baseSystemPrompt =
+        buildSystemPrompt() + '\n\n' + buildMemoryPromptSection();
+
+      if (this.permissionMode === 'plan') {
+        this.planFilePath = this.generatePlanFilePath();
+        this.systemPrompt = this.baseSystemPrompt + this.buildPlanModePrompt();
+      } else {
+        this.systemPrompt = this.baseSystemPrompt;
+      }
     }
   }
 
@@ -817,6 +863,58 @@ export class Agent {
     this.abortController?.abort();
   }
 
+  /**
+   * 文本输出路由 —— 根据模式决定输出目标
+   *
+   * 子 Agent 模式（outputBuffer !== null）：文本存入缓冲区，
+   * 由 runOnce() 在执行完成后一次性收集。
+   * 正常模式：直接通过 printAssistantText() 输出到 stdout。
+   *
+   * 之所以不在每个输出点做 if 判断，而是抽取为独立方法：
+   * 1. 减少重复代码（callApi 中有多处文本输出）
+   * 2. 未来如需增加输出目标（如日志文件），只需修改此处
+   */
+  private emitText(text: string): void {
+    if (this.outputBuffer) {
+      this.outputBuffer.push(text);
+    } else {
+      printAssistantText(text);
+    }
+  }
+
+  /**
+   * 子 Agent 单次执行入口
+   *
+   * 设置输出捕获缓冲区，执行一次完整的 chat 循环，
+   * 然后收集缓冲区中的所有文本作为结果返回。
+   *
+   * 返回值包含文本结果和增量 token 用量，
+   * 父 Agent 据此累加自己的 token 统计。
+   *
+   * @param prompt 任务指令（作为 user 消息发送给子 Agent）
+   * @returns      { text: 子 Agent 的输出文本, tokens: { input, output } }
+   */
+  async runOnce(
+    prompt: string,
+  ): Promise<{ text: string; tokens: { input: number; output: number } }> {
+    this.outputBuffer = [];
+    const prevInput = this.totalInputTokens;
+    const prevOutput = this.totalOutputTokens;
+
+    await this.chat(prompt);
+
+    const text = this.outputBuffer.join('');
+    this.outputBuffer = null;
+
+    return {
+      text,
+      tokens: {
+        input: this.totalInputTokens - prevInput,
+        output: this.totalOutputTokens - prevOutput,
+      },
+    };
+  }
+
   /** 获取累计 token 用量 */
   getTokenUsage() {
     return { input: this.totalInputTokens, output: this.totalOutputTokens };
@@ -911,16 +1009,14 @@ export class Agent {
 
     try {
       // 懒初始化 MCP 服务器连接（仅首次 chat 调用时执行）
-      // 放在 chat() 而非构造函数中，因为 MCP 连接是异步的，
-      // 构造函数不支持 async。首次调用后 mcpInitialized 标志防止重复连接。
-      if (!this.mcpInitialized) {
+      // 子 Agent 跳过 MCP 初始化：使用父 Agent 传入的 customTools
+      if (!this.mcpInitialized && !this.isSubAgent) {
         this.mcpInitialized = true;
         try {
           await this.mcpManager.loadAndConnect();
           this.mcpTools =
             this.mcpManager.getToolDefinitions() as Anthropic.Tool[];
         } catch (err: any) {
-          // MCP 初始化失败不应阻塞 Agent 主流程
           console.error(`[mcp] Initialization failed: ${err.message}`);
         }
       }
@@ -928,17 +1024,17 @@ export class Agent {
       await this.checkAndCompact();
 
       // ── 异步启动记忆预取（非阻塞，每个用户轮次触发一次）──
-      // 预取在后台运行，与后续 API 调用并行，不增加用户感知延迟。
-      // 结果在 while 循环内消费（settled 后注入到最后一条 user 消息）。
-      // 使用实例字段而非局部变量，以便 finally 中清理未消费的预取。
-      const sideQuery = this.buildSideQuery();
-      this.memoryPrefetch = startMemoryPrefetch(
-        userMessage,
-        sideQuery,
-        this.alreadySurfacedMemories,
-        this.sessionMemoryBytes,
-        this.abortController.signal,
-      );
+      // 子 Agent 跳过 memory prefetch：无需独立的记忆召回
+      if (!this.isSubAgent) {
+        const sideQuery = this.buildSideQuery();
+        this.memoryPrefetch = startMemoryPrefetch(
+          userMessage,
+          sideQuery,
+          this.alreadySurfacedMemories,
+          this.sessionMemoryBytes,
+          this.abortController.signal,
+        );
+      }
 
       while (true) {
         if (this.abortController.signal.aborted) break;
@@ -982,10 +1078,10 @@ export class Agent {
           }
         }
 
+        // 子 Agent 不显示 spinner（避免与父 Agent 输出冲突）
+        if (!this.isSubAgent) startSpinner();
+
         // ── 流式工具并发执行 ──
-        // 在 API 流式响应期间，每当一个并发安全工具的 content block 完成，
-        // 立即启动该工具的执行（不等待整个响应结束）。
-        // earlyExecutions 存储已启动的 Promise，在后续工具执行循环中直接 await。
         const earlyExecutions = new Map<string, Promise<string>>();
 
         // ── 调用 LLM（流式） ──
@@ -1010,6 +1106,8 @@ export class Agent {
             }
           }
         });
+
+        if (!this.isSubAgent) stopSpinner();
 
         // 记录 token 用量
         this.totalInputTokens += response.usage.input_tokens;
@@ -1081,9 +1179,20 @@ export class Agent {
             continue;
           }
 
+          // 拦截 agent 工具（由 Agent 内部处理，避免循环依赖）
+          // agent 工具派生子 Agent 实例，在独立上下文中执行任务
+          if (toolUse.name === 'agent') {
+            const result = await this.executeAgentTool(input);
+            printToolResult(toolUse.name, result);
+            toolResults.push({
+              type: 'tool_result',
+              tool_use_id: toolUse.id,
+              content: result,
+            });
+            continue;
+          }
+
           // MCP 工具路由：检测 mcp__ 前缀的工具名，转发到对应的 MCP 服务器
-          // MCP 调用是异步的（通过子进程 JSON-RPC 通信），
-          // 独立于同步的内置工具系统，避免将整个工具系统改为异步
           if (this.mcpManager.isMcpTool(toolUse.name)) {
             // Plan 模式下禁止 MCP 工具调用（plan 模式是只读的）
             if (this.permissionMode === 'plan') {
@@ -1174,14 +1283,16 @@ export class Agent {
         this.contextCleared = false;
       }
     } finally {
-      // 清理未消费的记忆预取：通过 abort 取消后台 sideQuery 请求，
-      // 避免模型直接返回纯文本时 sideQuery 白白完成却无人消费
+      // 清理未消费的记忆预取：通过 abort 取消后台 sideQuery 请求
       if (this.memoryPrefetch && !this.memoryPrefetch.consumed) {
         this.abortController?.abort();
       }
       this.memoryPrefetch = null;
       this.abortController = null;
-      this.autoSave();
+      // 子 Agent 不做会话持久化（短暂任务，无需保存）
+      if (!this.isSubAgent) {
+        this.autoSave();
+      }
     }
   }
 
@@ -1263,7 +1374,7 @@ export class Agent {
           model: this.model,
           max_tokens: thinkingEnabled ? maxOutput : 16384,
           system: this.systemPrompt,
-          tools: [...toolDefinitions, ...this.mcpTools],
+          tools: this.customTools || [...toolDefinitions, ...this.mcpTools],
           messages: this.messages,
           // thinking 参数：budget_tokens 必须严格小于 max_tokens（API 约束）
           ...(thinkingEnabled && {
@@ -1276,15 +1387,15 @@ export class Agent {
         { signal },
       );
 
-      // 流式输出文本内容
+      // 流式输出文本内容（子 Agent 输出到缓冲区，父 Agent 输出到 stdout）
       let firstText = true;
       stream.on('text', (text: string) => {
         if (firstText) {
-          stopSpinner();
-          printAssistantText('\n');
+          if (!this.isSubAgent) stopSpinner();
+          this.emitText('\n');
           firstText = false;
         }
-        printAssistantText(text);
+        this.emitText(text);
       });
 
       // ── 统一 streamEvent 处理器：thinking 输出 + tool_use block 追踪 ──
@@ -1306,7 +1417,7 @@ export class Agent {
         ) {
           if (this.thinkingMode !== 'disabled') {
             inThinking = true;
-            stopSpinner();
+            if (!this.isSubAgent) stopSpinner();
             printThinkingStart();
           }
         } else if (
@@ -1366,7 +1477,7 @@ export class Agent {
       });
 
       const finalMessage = await stream.finalMessage();
-      if (!firstText) printAssistantText('\n');
+      if (!firstText) this.emitText('\n');
 
       // 过滤掉 thinking blocks，不存入对话历史
       (finalMessage as any).content = finalMessage.content.filter(
@@ -1434,6 +1545,62 @@ export class Agent {
     if (this.confirmFn) return this.confirmFn(message);
     printConfirmFallback(message);
     return false;
+  }
+
+  // ─── Sub-Agent 执行 ─────────────────────────────────
+
+  /**
+   * 执行 agent 工具调用 —— 派生子 Agent 处理任务
+   *
+   * 流程：
+   * 1. 解析 type/description/prompt 参数
+   * 2. 通过 getSubAgentConfig() 获取子 Agent 的系统提示和工具集
+   * 3. 创建独立的 Agent 实例（isSubAgent=true），使用父 Agent 的 API 配置
+   * 4. 调用 subAgent.runOnce() 执行任务，捕获输出文本
+   * 5. 累加子 Agent 的 token 用量到父 Agent
+   *
+   * 子 Agent 的权限模式：
+   * - 父 Agent 在 plan 模式 → 子 Agent 也用 plan（保持只读约束）
+   * - 其他模式 → 子 Agent 用 bypassPermissions（子 Agent 是受控环境，无需二次确认）
+   *
+   * 递归防护：
+   * getSubAgentConfig() 返回的工具集已排除 "agent" 工具，
+   * 子 Agent 无法再次调用 agent 工具派生孙 Agent。
+   *
+   * @param input 工具输入参数 { type?, description, prompt }
+   * @returns     子 Agent 的执行结果文本
+   */
+  private async executeAgentTool(
+    input: Record<string, any>,
+  ): Promise<string> {
+    const type = (input.type || 'general') as SubAgentType;
+    const description = input.description || 'sub-agent task';
+    const prompt = input.prompt || '';
+
+    printSubAgentStart(type, description);
+
+    const config = getSubAgentConfig(type);
+    const subAgent = new Agent({
+      apiKey: this.client.apiKey || '',
+      apiBaseUrl: (this.client as any).baseURL || '',
+      model: this.model,
+      customSystemPrompt: config.systemPrompt,
+      customTools: config.tools,
+      isSubAgent: true,
+      permissionMode:
+        this.permissionMode === 'plan' ? 'plan' : 'bypassPermissions',
+    });
+
+    try {
+      const result = await subAgent.runOnce(prompt);
+      this.totalInputTokens += result.tokens.input;
+      this.totalOutputTokens += result.tokens.output;
+      printSubAgentEnd(type, description);
+      return result.text || '(Sub-agent produced no output)';
+    } catch (e: any) {
+      printSubAgentEnd(type, description);
+      return `Sub-agent error: ${e.message}`;
+    }
   }
 
   // ─── Plan Mode 内部方法 ─────────────────────────────

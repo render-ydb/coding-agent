@@ -404,6 +404,35 @@ export function printPlanApprovalOptions(): void {
 }
 
 // ─────────────────────────────────────────────────────────
+// Sub-Agent 输出
+// ─────────────────────────────────────────────────────────
+
+/**
+ * 打印子 Agent 启动提示
+ *
+ * 在父 Agent 派生子 Agent 时显示，包含类型和任务描述，
+ * 让用户知道有后台子任务正在执行。
+ *
+ * @param type        子 Agent 类型（explore/plan/general）
+ * @param description 任务简短描述
+ */
+export function printSubAgentStart(type: string, description: string): void {
+  console.log(`\n  🤖 Sub-agent [${type}] started: ${description}`);
+}
+
+/**
+ * 打印子 Agent 完成提示
+ *
+ * 子 Agent 执行结束时显示。
+ *
+ * @param type        子 Agent 类型
+ * @param description 任务简短描述
+ */
+export function printSubAgentEnd(type: string, description: string): void {
+  console.log(`  🤖 Sub-agent [${type}] finished: ${description}`);
+}
+
+// ─────────────────────────────────────────────────────────
 // Spinner（加载动画）
 // ─────────────────────────────────────────────────────────
 
