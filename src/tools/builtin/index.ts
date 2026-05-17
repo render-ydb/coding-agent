@@ -17,6 +17,7 @@ import { runShell } from './run-shell.js';
 import { enterPlanMode, exitPlanMode } from './plan-mode.js';
 import { agentTool } from './agent.js';
 import { skillTool } from './skill.js';
+import { toolSearch } from './tool-search.js';
 
 /**
  * 所有内置工具的有序数组
@@ -34,6 +35,7 @@ export const builtinTools: ToolDefinition[] = [
   runShell,
   agentTool,
   skillTool,
+  toolSearch,
   enterPlanMode,
   exitPlanMode,
 ];

@@ -30,6 +30,9 @@ import {
   executeTool,
   checkPermission,
   CONCURRENCY_SAFE_TOOLS,
+  getActiveToolDefinitions,
+  getDeferredToolNames,
+  resetActivatedTools,
   type PermissionMode,
   type PermissionResult,
 } from './tools/index.js';
@@ -726,13 +729,15 @@ export class Agent {
       this.baseSystemPrompt = options.customSystemPrompt;
       this.systemPrompt = this.baseSystemPrompt;
     } else {
-      // 组装系统提示：基础 + 记忆指令 + 可用 skill 列表
+      // 组装系统提示：基础 + 记忆指令 + 可用 skill 列表 + deferred 工具提示
       const skillSection = buildSkillPromptSection();
+      const deferredSection = this.buildDeferredToolsPromptSection();
       this.baseSystemPrompt =
         buildSystemPrompt() +
         '\n\n' +
         buildMemoryPromptSection() +
-        (skillSection ? '\n\n' + skillSection : '');
+        (skillSection ? '\n\n' + skillSection : '') +
+        (deferredSection ? '\n\n' + deferredSection : '');
 
       if (this.permissionMode === 'plan') {
         this.planFilePath = this.generatePlanFilePath();
@@ -867,6 +872,49 @@ export class Agent {
     };
   }
 
+  /**
+   * 构建 deferred 工具的系统提示段
+   *
+   * 告知模型哪些工具存在但未激活，需要通过 tool_search 搜索后才能使用。
+   * 这样模型知道这些工具的存在（按名称），无需为每个工具支付完整 schema 的 token 开销。
+   *
+   * 如果没有 deferred 工具（全部已激活或本身没有标记 deferred 的工具），返回空字符串。
+   */
+  private buildDeferredToolsPromptSection(): string {
+    const deferred = getDeferredToolNames();
+    if (deferred.length === 0) return '';
+    return (
+      `# Additional Tools (require activation)\n\n` +
+      `The following tools are available but require activation via the tool_search tool before use:\n` +
+      deferred.map((name) => `- ${name}`).join('\n') +
+      `\n\nTo use any of these tools, first call tool_search with the tool name or a relevant keyword.`
+    );
+  }
+
+  /**
+   * 刷新系统提示词
+   *
+   * 重新构建 baseSystemPrompt（含 deferred 工具列表）并更新 systemPrompt。
+   * 用于 clearHistory() 后重置 deferred 工具激活状态时，
+   * 让 system prompt 中的 deferred 工具名列表回到初始状态。
+   */
+  private refreshSystemPrompt(): void {
+    const skillSection = buildSkillPromptSection();
+    const deferredSection = this.buildDeferredToolsPromptSection();
+    this.baseSystemPrompt =
+      buildSystemPrompt() +
+      '\n\n' +
+      buildMemoryPromptSection() +
+      (skillSection ? '\n\n' + skillSection : '') +
+      (deferredSection ? '\n\n' + deferredSection : '');
+
+    if (this.permissionMode === 'plan' && this.planFilePath) {
+      this.systemPrompt = this.baseSystemPrompt + this.buildPlanModePrompt();
+    } else {
+      this.systemPrompt = this.baseSystemPrompt;
+    }
+  }
+
   /** 中断当前请求（由 REPL 的 SIGINT 处理器调用） */
   abort(): void {
     this.abortController?.abort();
@@ -929,7 +977,13 @@ export class Agent {
     return { input: this.totalInputTokens, output: this.totalOutputTokens };
   }
 
-  /** 清空对话历史（Anthropic 的 system prompt 不在 messages 中，直接清空即可） */
+  /**
+   * 清空对话历史
+   *
+   * Anthropic 的 system prompt 不在 messages 中，直接清空即可。
+   * 同时重置 deferred 工具激活状态并刷新 system prompt，
+   * 确保新对话以干净的工具集开始（deferred 工具重新列入 system prompt 提示段）。
+   */
   clearHistory(): void {
     this.messages = [];
     this.totalInputTokens = 0;
@@ -939,6 +993,9 @@ export class Agent {
     // 重置记忆追踪状态（新对话不应受旧会话的去重/预算限制）
     this.alreadySurfacedMemories.clear();
     this.sessionMemoryBytes = 0;
+    // 重置 deferred 工具激活状态，刷新 system prompt 中的 deferred 工具列表
+    resetActivatedTools();
+    this.refreshSystemPrompt();
   }
 
   /**
@@ -1390,12 +1447,19 @@ export class Agent {
       const thinkingEnabled =
         this.thinkingMode === 'adaptive' || this.thinkingMode === 'enabled';
 
+      // getActiveToolDefinitions() 过滤掉未激活的 deferred 工具，
+      // 减少每次 API 调用的 token 开销。
+      // 子 Agent 传入 customTools 时直接使用（不做 deferred 过滤）。
+      const activeTools = this.customTools
+        ? getActiveToolDefinitions(this.customTools)
+        : [...getActiveToolDefinitions(), ...this.mcpTools];
+
       const stream = this.client.messages.stream(
         {
           model: this.model,
           max_tokens: thinkingEnabled ? maxOutput : 16384,
           system: this.systemPrompt,
-          tools: this.customTools || [...toolDefinitions, ...this.mcpTools],
+          tools: activeTools,
           messages: this.messages,
           // thinking 参数：budget_tokens 必须严格小于 max_tokens（API 约束）
           ...(thinkingEnabled && {

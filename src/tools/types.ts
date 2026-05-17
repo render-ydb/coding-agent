@@ -21,8 +21,15 @@ import type Anthropic from '@anthropic-ai/sdk';
  *                        返回字符串结果。结果会作为 tool_result 发回给模型。
  *                        无论成功或失败都返回 string（错误信息也是字符串），
  *                        这样模型可以自行解读错误并决定下一步。
+ * @property deferred   - 可选标记：延迟加载工具。
+ *                        标记为 deferred 的工具不会在每次 API 请求中发送完整 schema，
+ *                        仅将工具名通过 system prompt 告知模型。模型通过调用 tool_search
+ *                        工具搜索并激活后，完整 schema 才会在后续请求中出现。
+ *                        这是一种 token 优化策略：不常用的工具（如 plan mode 工具）
+ *                        只按需加载，减少每次 API 调用的 token 开销。
  */
 export interface ToolDefinition {
   definition: Anthropic.Tool;
   execute: (input: Record<string, any>) => string;
+  deferred?: boolean;
 }

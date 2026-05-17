@@ -32,6 +32,7 @@ export const enterPlanMode: ToolDefinition = {
     },
   },
   execute: () => '[Plan mode tool - handled by Agent]',
+  deferred: true,
 };
 
 /**
@@ -53,4 +54,5 @@ export const exitPlanMode: ToolDefinition = {
     },
   },
   execute: () => '[Plan mode tool - handled by Agent]',
+  deferred: true,
 };

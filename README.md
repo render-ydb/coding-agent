@@ -57,6 +57,21 @@ npm run build && npm start
 | `grep_search` | 正则表达式跨文件搜索 | `src/tools/builtin/grep-search.ts` |
 | `run_shell` | 执行 shell 命令，支持超时控制 | `src/tools/builtin/run-shell.ts` |
 | `agent` | 派生子 Agent 执行独立任务（explore/plan/general） | `src/tools/builtin/agent.ts` |
+| `tool_search` | 搜索并激活延迟加载的工具（动态工具过滤） | `src/tools/builtin/tool-search.ts` |
+
+### 动态工具过滤（Deferred Tool Activation）
+
+不常用的工具（如 Plan Mode 工具）默认不发送完整 schema 给模型，仅以名称告知。模型需要时通过 `tool_search` 按需激活，减少每次 API 调用的 token 开销。
+
+| 特性 | 说明 |
+|------|------|
+| `deferred` 标记 | 在 `ToolDefinition` 上设置 `deferred: true`，一行配置 |
+| 激活机制 | 模型调用 `tool_search(query="关键词")`，模糊匹配名称和描述 |
+| System Prompt 提示 | 未激活的 deferred 工具名注入到 system prompt，模型知其存在 |
+| Token 节省 | 每个 deferred 工具每次 API 调用约省 200-500 token |
+| 当前 deferred 工具 | `enter_plan_mode`、`exit_plan_mode` |
+
+详细设计文档见 [docs/deferred-tools.md](docs/deferred-tools.md)。
 
 ### 权限系统
 
@@ -367,14 +382,17 @@ coding-agent/
 │           ├── grep-search.ts  # 搜索文件
 │           ├── run-shell.ts    # 执行命令
 │           ├── agent.ts        # Sub-Agent 工具（派生子 Agent）
-│           └── plan-mode.ts    # Plan Mode 工具（enter/exit_plan_mode）
+│           ├── skill.ts        # Skill 工具（调用预定义技能）
+│           ├── tool-search.ts  # 工具搜索（动态激活 deferred 工具）
+│           └── plan-mode.ts    # Plan Mode 工具（enter/exit_plan_mode, deferred）
 ├── docs/
 │   ├── sub-agent-system.md            # Sub-Agent 系统设计文档
 │   ├── memory-system.md              # Memory 语义召回设计文档
 │   ├── context-management-design.md  # 上下文管理设计文档
 │   ├── plan-mode.md                  # Plan Mode 设计文档
 │   ├── mcp.md                        # MCP 集成设计文档
-│   └── streaming-tool-execution.md   # 流式工具并发执行设计文档
+│   ├── streaming-tool-execution.md   # 流式工具并发执行设计文档
+│   └── deferred-tools.md            # 动态工具过滤设计文档
 ├── package.json
 ├── tsconfig.json
 └── .env                       # API_KEY, API_BASE_URL, MODEL
