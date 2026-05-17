@@ -36,6 +36,10 @@ import {
 import { McpManager } from './mcp.js';
 import { saveSession, type SessionData } from './session.js';
 import {
+  executeSkill,
+  buildSkillPromptSection,
+} from './skills.js';
+import {
   startMemoryPrefetch,
   formatMemoriesForInjection,
   buildMemoryPromptSection,
@@ -722,8 +726,13 @@ export class Agent {
       this.baseSystemPrompt = options.customSystemPrompt;
       this.systemPrompt = this.baseSystemPrompt;
     } else {
+      // 组装系统提示：基础 + 记忆指令 + 可用 skill 列表
+      const skillSection = buildSkillPromptSection();
       this.baseSystemPrompt =
-        buildSystemPrompt() + '\n\n' + buildMemoryPromptSection();
+        buildSystemPrompt() +
+        '\n\n' +
+        buildMemoryPromptSection() +
+        (skillSection ? '\n\n' + skillSection : '');
 
       if (this.permissionMode === 'plan') {
         this.planFilePath = this.generatePlanFilePath();
@@ -1192,6 +1201,18 @@ export class Agent {
             continue;
           }
 
+          // 拦截 skill 工具（由 Agent 内部处理，fork 模式需要创建子 Agent）
+          if (toolUse.name === 'skill') {
+            const result = await this.executeSkillTool(input);
+            printToolResult(toolUse.name, result);
+            toolResults.push({
+              type: 'tool_result',
+              tool_use_id: toolUse.id,
+              content: result,
+            });
+            continue;
+          }
+
           // MCP 工具路由：检测 mcp__ 前缀的工具名，转发到对应的 MCP 服务器
           if (this.mcpManager.isMcpTool(toolUse.name)) {
             // Plan 模式下禁止 MCP 工具调用（plan 模式是只读的）
@@ -1601,6 +1622,73 @@ export class Agent {
       printSubAgentEnd(type, description);
       return `Sub-agent error: ${e.message}`;
     }
+  }
+
+  // ─── Skill 执行 ──────────────────────────────────────
+
+  /**
+   * 执行 skill 工具调用 —— 按模式分发 inline 或 fork
+   *
+   * 流程：
+   * 1. 通过 executeSkill() 查找 skill 并解析模板
+   * 2. 根据 context 字段决定执行方式：
+   *    - inline：将 prompt 作为 tool_result 注入对话，
+   *      模型在当前上下文中按 prompt 指令继续工作
+   *    - fork：创建隔离的子 Agent，以 skill prompt 为系统提示，
+   *      可选通过 allowedTools 限制可用工具集，完成后仅返回结果文本
+   *
+   * fork 模式的子 Agent 配置：
+   * - isSubAgent: true（跳过 MCP/memory/autoSave）
+   * - permissionMode: 继承父 Agent 的 plan 或 bypassPermissions
+   * - customTools: 按 allowedTools 过滤，排除 agent 工具防止递归
+   *
+   * @param input 工具输入参数 { skill_name, args? }
+   * @returns     skill 执行结果文本
+   */
+  private async executeSkillTool(
+    input: Record<string, any>,
+  ): Promise<string> {
+    const skillName = input.skill_name;
+    const args = input.args || '';
+
+    const result = executeSkill(skillName, args);
+    if (!result) return `Unknown skill: ${skillName}`;
+
+    if (result.context === 'fork') {
+      // Fork 模式：在隔离子 Agent 中执行
+      const allTools = this.customTools || [...toolDefinitions, ...this.mcpTools];
+      const tools = result.allowedTools
+        ? allTools.filter(
+            (t) => result.allowedTools!.includes(t.name),
+          )
+        : allTools.filter((t) => t.name !== 'agent');
+
+      printSubAgentStart('general', `skill:${skillName}`);
+      const subAgent = new Agent({
+        apiKey: this.client.apiKey || '',
+        apiBaseUrl: (this.client as any).baseURL || '',
+        model: this.model,
+        customSystemPrompt: result.prompt,
+        customTools: tools,
+        isSubAgent: true,
+        permissionMode:
+          this.permissionMode === 'plan' ? 'plan' : 'bypassPermissions',
+      });
+
+      try {
+        const subResult = await subAgent.runOnce(args || 'Execute this skill task.');
+        this.totalInputTokens += subResult.tokens.input;
+        this.totalOutputTokens += subResult.tokens.output;
+        printSubAgentEnd('general', `skill:${skillName}`);
+        return subResult.text || '(Skill produced no output)';
+      } catch (e: any) {
+        printSubAgentEnd('general', `skill:${skillName}`);
+        return `Skill fork error: ${e.message}`;
+      }
+    }
+
+    // Inline 模式：返回 prompt 作为 tool_result 注入当前对话
+    return `[Skill "${skillName}" activated]\n\n${result.prompt}`;
   }
 
   // ─── Plan Mode 内部方法 ─────────────────────────────

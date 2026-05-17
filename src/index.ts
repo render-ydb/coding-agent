@@ -15,6 +15,7 @@ import 'dotenv/config';
 import { Agent, type PermissionMode } from './agent.js';
 import { getLatestSessionId, loadSession } from './session.js';
 import { listMemories } from './memory.js';
+import { discoverSkills, getSkillByName } from './skills.js';
 import {
   printHelp,
   printWelcome,
@@ -368,11 +369,23 @@ async function runRepl(agent: Agent): Promise<void> {
       }
 
       if (input === '/skills') {
-        // 列出所有可用的技能
-        // TODO: 接入 skills 模块后调用 discoverSkills()
-        printInfo(
-          'No skills found. Add skills to .claude/skills/<name>/SKILL.md',
-        );
+        const skills = discoverSkills();
+        if (skills.size === 0) {
+          printInfo(
+            'No skills found. Add skills to .claude/skills/<name>/SKILL.md',
+          );
+        } else {
+          console.log(`\n  Skills (${skills.size}):`);
+          for (const [name, skill] of skills) {
+            const invocable = skill.userInvocable ? '/' : ' ';
+            const mode = skill.context === 'fork' ? '[fork]' : '[inline]';
+            const src = skill.source === 'project' ? 'project' : 'user';
+            console.log(
+              `    ${invocable}${name} ${mode} (${src}) — ${skill.description || '(no description)'}`,
+            );
+          }
+          console.log();
+        }
         askQuestion();
         return;
       }
@@ -385,11 +398,42 @@ async function runRepl(agent: Agent): Promise<void> {
         const spaceIdx = input.indexOf(' ');
         const cmdName =
           spaceIdx > 0 ? input.slice(1, spaceIdx) : input.slice(1);
-        const _cmdArgs = spaceIdx > 0 ? input.slice(spaceIdx + 1) : '';
+        const cmdArgs = spaceIdx > 0 ? input.slice(spaceIdx + 1) : '';
 
-        // TODO: 接入 skills 模块后查找并执行技能
-        // const skill = getSkillByName(cmdName);
-        // if (skill && skill.userInvocable) { ... }
+        const skill = getSkillByName(cmdName);
+        if (skill && skill.userInvocable) {
+          // skill 调用：
+          // - fork 模式：告诉 agent 使用 skill 工具（会创建子 Agent）
+          // - inline 模式：直接将解析后的 prompt 作为用户消息发送给 agent
+          try {
+            isProcessing = true;
+            if (skill.context === 'fork') {
+              await agent.chat(
+                `Use the skill tool to invoke "${cmdName}" with args: ${cmdArgs || '(none)'}`,
+              );
+            } else {
+              // inline：导入并解析 skill prompt，直接作为聊天输入
+              const { executeSkill: execSkill } = await import('./skills.js');
+              const result = execSkill(cmdName, cmdArgs);
+              if (result) {
+                await agent.chat(result.prompt);
+              }
+            }
+          } catch (e: unknown) {
+            const error = e as Error;
+            if (
+              error.name !== 'AbortError' &&
+              !error.message?.includes('aborted')
+            ) {
+              printError(error.message);
+            }
+          } finally {
+            isProcessing = false;
+          }
+          askQuestion();
+          return;
+        }
+
         printInfo(`Unknown command: /${cmdName}`);
         askQuestion();
         return;
