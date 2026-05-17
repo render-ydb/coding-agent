@@ -499,6 +499,18 @@ export class Agent {
    */
   private contextCleared = false;
 
+  // ── Permission 会话白名单 ──
+  /**
+   * 已确认路径/命令的白名单
+   *
+   * 当用户在 confirm 模式下批准某个操作时，将操作描述（文件路径或命令）
+   * 加入此集合。后续对同一路径/命令的操作自动放行，不再重复询问。
+   *
+   * 生命周期与 Agent 实例相同，不跨会话持久化。
+   * 这避免了用户在同一文件上多次编辑时被反复询问的烦扰。
+   */
+  private confirmedPaths: Set<string> = new Set();
+
   // ── Read-before-edit 追踪 ──
   /**
    * 文件读取状态追踪（绝对路径 → mtimeMs）
@@ -940,14 +952,18 @@ export class Agent {
           if (perm === 'confirm') {
             const desc =
               toolUse.name === 'run_shell' ? input.command : input.file_path;
-            const allowed = await this.confirm(`Allow: ${desc}`);
-            if (!allowed) {
-              toolResults.push({
-                type: 'tool_result',
-                tool_use_id: toolUse.id,
-                content: 'User denied this action.',
-              });
-              continue;
+            // 会话白名单：已确认过的路径/命令自动放行
+            if (!this.confirmedPaths.has(desc)) {
+              const allowed = await this.confirm(`Allow: ${desc}`);
+              if (!allowed) {
+                toolResults.push({
+                  type: 'tool_result',
+                  tool_use_id: toolUse.id,
+                  content: 'User denied this action.',
+                });
+                continue;
+              }
+              this.confirmedPaths.add(desc);
             }
           }
 
