@@ -36,6 +36,13 @@ import {
 import { McpManager } from './mcp.js';
 import { saveSession, type SessionData } from './session.js';
 import {
+  startMemoryPrefetch,
+  formatMemoriesForInjection,
+  buildMemoryPromptSection,
+  type MemoryPrefetch,
+  type SideQueryFn,
+} from './memory.js';
+import {
   printToolCall,
   printToolResult,
   printAssistantText,
@@ -542,6 +549,38 @@ export class Agent {
    */
   private readFileState: Map<string, number> = new Map();
 
+  // ── Memory 语义召回 ──
+  /**
+   * 已在本会话中展示过的记忆文件路径集合（去重用）
+   *
+   * 同一条记忆在同一会话中只注入一次，避免重复占用上下文。
+   * 使用文件绝对路径作为唯一标识。
+   * 生命周期与 Agent 实例相同，不跨会话持久化。
+   */
+  private alreadySurfacedMemories: Set<string> = new Set();
+  /**
+   * 本会话已注入的记忆内容累计字节数
+   *
+   * 用于预算控制：当累计超过 MAX_SESSION_MEMORY_BYTES (60KB) 时，
+   * startMemoryPrefetch() 返回 null，停止召回新记忆。
+   * 避免记忆占据过多上下文空间。
+   */
+  private sessionMemoryBytes = 0;
+  /**
+   * 当前正在进行的记忆预取句柄
+   *
+   * 提升为实例字段（而非 chat() 局部变量），原因：
+   * 1. 在 finally 块中需要检查并清理未消费的预取
+   * 2. 避免模型直接返回纯文本（无 tool_use）时预取的 sideQuery
+   *    在后台白白完成却无人消费的资源浪费
+   *
+   * 生命周期：
+   * - chat() 入口处创建（可能为 null，门控未通过时）
+   * - while 循环内消费（settled 后注入并置 consumed=true）
+   * - finally 中清理（未消费时通过 abort 取消 sideQuery）
+   */
+  private memoryPrefetch: MemoryPrefetch | null = null;
+
   // ── MCP 集成 ──
   /**
    * MCP 管理器实例
@@ -636,8 +675,9 @@ export class Agent {
     this.maxTurns = options.maxTurns;
     this.effectiveWindow = getContextWindow(this.model) - 20000;
 
-    // 保存基础系统提示，plan 模式在此基础上追加指令
-    this.baseSystemPrompt = buildSystemPrompt();
+    // 保存基础系统提示，包含记忆系统指令段落，plan 模式在此基础上追加指令
+    this.baseSystemPrompt =
+      buildSystemPrompt() + '\n\n' + buildMemoryPromptSection();
 
     // 若通过 --plan 启动，初始化 plan 文件并追加 plan 模式提示
     if (this.permissionMode === 'plan') {
@@ -735,6 +775,43 @@ export class Agent {
     return 'enabled';
   }
 
+  /**
+   * 构建 sideQuery 函数用于记忆语义召回
+   *
+   * sideQuery 是一个轻量的 LLM 调用，使用与主对话相同的模型和客户端实例，
+   * 但以极小的 max_tokens (256) 运行，仅用于从记忆清单中选择相关文件。
+   *
+   * 返回的函数签名与 SideQueryFn 类型匹配。
+   *
+   * 为什么不用流式？
+   * - 响应极短（<256 tokens），流式开销不值得
+   * - 非流式调用更简单可靠
+   * - 这是后台异步调用，不需要向用户展示中间结果
+   */
+  private buildSideQuery(): SideQueryFn {
+    const client = this.client;
+    const model = this.model;
+    return async (
+      system: string,
+      userMessage: string,
+      signal?: AbortSignal,
+    ): Promise<string> => {
+      const resp = await client.messages.create(
+        {
+          model,
+          max_tokens: 256,
+          system,
+          messages: [{ role: 'user', content: userMessage }],
+        },
+        { signal },
+      );
+      return resp.content
+        .filter((b): b is Anthropic.TextBlock => b.type === 'text')
+        .map((b) => b.text)
+        .join('');
+    };
+  }
+
   /** 中断当前请求（由 REPL 的 SIGINT 处理器调用） */
   abort(): void {
     this.abortController?.abort();
@@ -752,6 +829,9 @@ export class Agent {
     this.totalOutputTokens = 0;
     this.lastInputTokenCount = 0;
     this.lastApiCallTime = 0;
+    // 重置记忆追踪状态（新对话不应受旧会话的去重/预算限制）
+    this.alreadySurfacedMemories.clear();
+    this.sessionMemoryBytes = 0;
   }
 
   /**
@@ -837,7 +917,8 @@ export class Agent {
         this.mcpInitialized = true;
         try {
           await this.mcpManager.loadAndConnect();
-          this.mcpTools = this.mcpManager.getToolDefinitions() as Anthropic.Tool[];
+          this.mcpTools =
+            this.mcpManager.getToolDefinitions() as Anthropic.Tool[];
         } catch (err: any) {
           // MCP 初始化失败不应阻塞 Agent 主流程
           console.error(`[mcp] Initialization failed: ${err.message}`);
@@ -846,10 +927,60 @@ export class Agent {
 
       await this.checkAndCompact();
 
+      // ── 异步启动记忆预取（非阻塞，每个用户轮次触发一次）──
+      // 预取在后台运行，与后续 API 调用并行，不增加用户感知延迟。
+      // 结果在 while 循环内消费（settled 后注入到最后一条 user 消息）。
+      // 使用实例字段而非局部变量，以便 finally 中清理未消费的预取。
+      const sideQuery = this.buildSideQuery();
+      this.memoryPrefetch = startMemoryPrefetch(
+        userMessage,
+        sideQuery,
+        this.alreadySurfacedMemories,
+        this.sessionMemoryBytes,
+        this.abortController.signal,
+      );
+
       while (true) {
         if (this.abortController.signal.aborted) break;
 
         this.runCompressionPipeline();
+
+        // ── 消费记忆预取结果（非阻塞轮询）──
+        // 每次循环迭代都检查，确保模型尽快看到召回的记忆。
+        // 记忆内容追加到最后一条 user 消息中，
+        // 避免连续 user 消息违反 Anthropic API 的交替规则。
+        if (
+          this.memoryPrefetch &&
+          this.memoryPrefetch.settled &&
+          !this.memoryPrefetch.consumed
+        ) {
+          this.memoryPrefetch.consumed = true;
+          try {
+            const memories = await this.memoryPrefetch.promise;
+            if (memories.length > 0) {
+              const injectionText = formatMemoriesForInjection(memories);
+              const last = this.messages[this.messages.length - 1];
+              if (last && last.role === 'user') {
+                if (typeof last.content === 'string') {
+                  last.content = last.content + '\n\n' + injectionText;
+                } else if (Array.isArray(last.content)) {
+                  (last.content as any[]).push({
+                    type: 'text',
+                    text: injectionText,
+                  });
+                }
+              } else {
+                this.messages.push({ role: 'user', content: injectionText });
+              }
+              for (const m of memories) {
+                this.alreadySurfacedMemories.add(m.path);
+                this.sessionMemoryBytes += Buffer.byteLength(m.content);
+              }
+            }
+          } catch {
+            /* 预取错误已在 memory.ts 中记录日志 */
+          }
+        }
 
         // ── 流式工具并发执行 ──
         // 在 API 流式响应期间，每当一个并发安全工具的 content block 完成，
@@ -1043,6 +1174,12 @@ export class Agent {
         this.contextCleared = false;
       }
     } finally {
+      // 清理未消费的记忆预取：通过 abort 取消后台 sideQuery 请求，
+      // 避免模型直接返回纯文本时 sideQuery 白白完成却无人消费
+      if (this.memoryPrefetch && !this.memoryPrefetch.consumed) {
+        this.abortController?.abort();
+      }
+      this.memoryPrefetch = null;
       this.abortController = null;
       this.autoSave();
     }
@@ -1371,7 +1508,9 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
       this.permissionMode = 'plan';
       this.planFilePath = this.generatePlanFilePath();
       this.systemPrompt = this.baseSystemPrompt + this.buildPlanModePrompt();
-      printInfo('Entered plan mode (read-only). Plan file: ' + this.planFilePath);
+      printInfo(
+        'Entered plan mode (read-only). Plan file: ' + this.planFilePath,
+      );
       return (
         `Entered plan mode. You are now in read-only mode.\n\n` +
         `Your plan file: ${this.planFilePath}\n` +
@@ -1407,7 +1546,10 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
 
         // 用户批准：确定目标权限模式
         let targetMode: PermissionMode;
-        if (result.choice === 'clear-and-execute' || result.choice === 'execute') {
+        if (
+          result.choice === 'clear-and-execute' ||
+          result.choice === 'execute'
+        ) {
           targetMode = 'acceptEdits';
         } else {
           // manual-execute: 恢复进入 plan 前的原始权限模式
@@ -1425,7 +1567,9 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
         if (result.choice === 'clear-and-execute') {
           this.clearHistoryKeepSystem();
           this.contextCleared = true;
-          printInfo(`Plan approved. Context cleared, executing in ${targetMode} mode.`);
+          printInfo(
+            `Plan approved. Context cleared, executing in ${targetMode} mode.`,
+          );
           return (
             `User approved the plan. Context was cleared. Permission mode: ${targetMode}\n\n` +
             `Plan file: ${savedPlanPath}\n\n` +
@@ -1447,7 +1591,9 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
       this.prePlanMode = null;
       this.planFilePath = null;
       this.systemPrompt = this.baseSystemPrompt;
-      printInfo('Exited plan mode. Restored to ' + this.permissionMode + ' mode.');
+      printInfo(
+        'Exited plan mode. Restored to ' + this.permissionMode + ' mode.',
+      );
       return (
         `Exited plan mode. Permission mode restored to: ${this.permissionMode}\n\n` +
         `## Your Plan:\n${planContent}`

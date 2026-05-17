@@ -109,6 +109,59 @@ coding-agent --plan "重构 auth 模块"
 
 详细设计文档见 [docs/plan-mode.md](docs/plan-mode.md)。
 
+### Memory 语义召回（跨会话记忆）
+
+文件级持久化记忆系统，每轮用户输入时异步预取相关记忆，通过 sideQuery LLM 调用语义选择，非阻塞注入到对话上下文。
+
+**记忆类型：**
+
+| 类型 | 用途 | 示例 |
+|------|------|------|
+| `user` | 用户角色、偏好、知识水平 | "用户是后端工程师，熟悉 Go" |
+| `feedback` | 用户纠正和指导 | "测试不要 mock，用真数据库" |
+| `project` | 进行中的工作、目标、截止日期 | "3/5 后代码冻结" |
+| `reference` | 外部资源指针 | "bug 追踪在 Linear INGEST 项目" |
+
+**存储位置：** `~/.coding-agent/projects/{sha256-hash}/memory/`（按工作目录隔离）
+
+**语义召回流程：**
+
+```
+用户输入 → 三重门控检查 → 异步 sideQuery（后台 LLM，256 tokens）
+                              ↓
+              scanMemoryHeaders（仅读 frontmatter）
+              → formatMemoryManifest → 模型选择 ≤5 条
+              → 读取完整内容 → 注入到 user 消息
+```
+
+**三重门控（任一不通过则跳过召回）：**
+
+| 门控 | 条件 | 原因 |
+|------|------|------|
+| 输入实质性 | 2+ CJK 字符 或 多词 | 单词指令（"hi"、"/clear"）无语义上下文 |
+| 会话预算 | 累计注入 < 60KB | 防止记忆挤占工具调用空间 |
+| 记忆存在 | 磁盘上有 .md 文件 | 首次使用时零开销 |
+
+**预算限制：**
+
+| 层级 | 限制 | 说明 |
+|------|------|------|
+| 单文件 | 4 KB | 注入时截断 |
+| 单次选择 | 5 条 | sideQuery 最多选 5 条 |
+| 会话总量 | 60 KB | 超出后停止预取 |
+| 文件数量 | 200 个 | 扫描上限 |
+
+```bash
+# 查看当前记忆
+> /memory
+
+  Memories (2):
+    [user] 用户角色 — 高级后端工程师，熟悉 Go 和 K8s
+    [feedback] 测试规范 — 不要用 mock，必须用真数据库
+```
+
+详细设计文档见 [docs/memory-system.md](docs/memory-system.md)。
+
 ### 上下文管理（5 层递进压缩管道）
 
 | 层级 | 名称 | 触发条件 | 策略 | API 开销 |
@@ -219,6 +272,7 @@ coding-agent
 | `/plan` | 切换 Plan Mode（只读规划 ↔ 正常模式） |
 | `/cost` | 显示 token 用量和估算费用 |
 | `/compact` | 手动触发对话压缩 |
+| `/memory` | 列出当前项目的所有记忆 |
 | 双次 Ctrl+C | 第一次中断当前请求，第二次退出程序 |
 
 ### 命令行参数
@@ -242,8 +296,12 @@ coding-agent
 coding-agent/
 ├── src/
 │   ├── index.ts              # CLI 入口：参数解析、REPL 循环、.env 配置加载
-│   ├── agent.ts              # 核心引擎：Agent Loop、流式响应、上下文压缩
+│   ├── agent.ts              # 核心引擎：Agent Loop、流式响应、上下文压缩、记忆集成
+│   ├── memory.ts             # 记忆系统：CRUD、语义召回、预取、系统提示
+│   ├── frontmatter.ts        # YAML frontmatter 解析器（被 memory.ts 依赖）
+│   ├── session.ts            # 会话持久化：save/load/list
 │   ├── mcp.ts                # MCP 客户端：JSON-RPC over stdio，工具发现和路由
+│   ├── ui.ts                 # 终端输出：spinner、工具展示、plan 审批 UI
 │   └── tools/
 │       ├── index.ts           # 工具注册表和路由器
 │       ├── types.ts           # ToolDefinition 接口定义
@@ -258,6 +316,7 @@ coding-agent/
 │           ├── run-shell.ts    # 执行命令
 │           └── plan-mode.ts    # Plan Mode 工具（enter/exit_plan_mode）
 ├── docs/
+│   ├── memory-system.md              # Memory 语义召回设计文档
 │   ├── context-management-design.md  # 上下文管理设计文档
 │   ├── plan-mode.md                  # Plan Mode 设计文档
 │   ├── mcp.md                        # MCP 集成设计文档

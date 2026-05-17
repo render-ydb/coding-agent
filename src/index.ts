@@ -14,6 +14,7 @@ import * as readline from 'node:readline';
 import 'dotenv/config';
 import { Agent, type PermissionMode } from './agent.js';
 import { getLatestSessionId, loadSession } from './session.js';
+import { listMemories } from './memory.js';
 import {
   printHelp,
   printWelcome,
@@ -350,9 +351,18 @@ async function runRepl(agent: Agent): Promise<void> {
       }
 
       if (input === '/memory') {
-        // 列出所有已保存的记忆
-        // TODO: 接入 memory 模块后调用 listMemories()
-        printInfo('No memories saved yet.');
+        const memories = listMemories();
+        if (memories.length === 0) {
+          printInfo('No memories saved yet.');
+        } else {
+          console.log(`\n  Memories (${memories.length}):`);
+          for (const m of memories) {
+            console.log(
+              `    [${m.type}] ${m.name} — ${m.description || '(no description)'}`,
+            );
+          }
+          console.log();
+        }
         askQuestion();
         return;
       }
