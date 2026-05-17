@@ -499,6 +499,20 @@ export class Agent {
    */
   private contextCleared = false;
 
+  // ── Read-before-edit 追踪 ──
+  /**
+   * 文件读取状态追踪（绝对路径 → mtimeMs）
+   *
+   * 记录每个被 read_file 读取过的文件的最后修改时间戳。
+   * 在 write_file / edit_file 执行前做两层校验：
+   * 1. 文件是否曾被读取（防止模型盲写未读取的文件）
+   * 2. 文件在读取后是否被外部修改（防止覆盖用户或其他进程的改动）
+   *
+   * 生命周期与 Agent 实例相同，不跨会话持久化。
+   * 新建文件（不存在于磁盘）跳过检查。
+   */
+  private readFileState: Map<string, number> = new Map();
+
   // ── MCP 集成 ──
   /**
    * MCP 管理器实例
@@ -937,8 +951,8 @@ export class Agent {
             }
           }
 
-          // 执行工具，超大结果持久化到磁盘
-          const raw = executeTool(toolUse.name, input);
+          // 执行工具，传入 readFileState 以启用 read-before-edit 校验
+          const raw = executeTool(toolUse.name, input, this.readFileState);
           const result = this.persistLargeResult(toolUse.name, raw);
           printToolResult(toolUse.name, result);
 
