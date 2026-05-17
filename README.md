@@ -44,6 +44,7 @@ npm run build && npm start
 | 预算控制 | 支持最大花费（美元）和最大轮次限制，超出自动停止 | `src/agent.ts` `isBudgetExceeded()` |
 | Token 统计 | 累计输入/输出 token 计数和费用估算 | `src/agent.ts` `getTokenUsage()` |
 | Extended Thinking | 模型内部推理链，支持 adaptive/enabled 两种模式 | `src/agent.ts` `callApi()` |
+| 流式工具并发执行 | tool_use block 流式完成时立即启动只读工具，与后续 block 传输并行 | `src/agent.ts` `callApi()` |
 
 ### 工具系统
 
@@ -139,6 +140,25 @@ coding-agent --thinking "分析这段代码的性能瓶颈"
 # 配合其他参数使用
 coding-agent --thinking --yolo "重构这个函数并解释你的推理过程"
 ```
+
+### 流式工具并发执行（Streaming Tool Execution）
+
+当模型在一次响应中返回多个 tool_use block 时（如同时读取 3 个文件），传统做法是等待流式响应**完全结束**后才开始逐个执行工具。流式并发执行改为：每当一个 tool_use block 在流式传输中完成，**立即启动**该工具的执行。
+
+```
+传统：  [流式响应完成] → 执行 tool A → 执行 tool B → 发送结果
+并发：  [tool A 流完 → 立即执行] [tool B 流完 → 立即执行] [流式结束 → 收集结果(秒出)]
+```
+
+| 特性 | 说明 |
+|------|------|
+| 安全工具集 | `read_file`、`list_files`、`grep_search`（无副作用的纯读取操作） |
+| 权限前置校验 | 回调中调用 `checkPermission`，仅 `action=allow` 时提前启动 |
+| 流式追踪 | 通过 `toolBlocksByIndex` Map 逐步累积 `input_json_delta`，block 结束时解析完整 JSON |
+| 结果消费 | 工具执行循环中通过 `earlyExecutions` Map 查找已启动的 Promise，命中则跳过常规权限检查 |
+| 安全保障 | `run_shell` 不纳入、需确认的操作不提前执行、Plan 模式读操作正常工作 |
+
+详细设计文档见 [docs/streaming-tool-execution.md](docs/streaming-tool-execution.md)。
 
 ### MCP 集成（外部工具扩展）
 
@@ -240,7 +260,8 @@ coding-agent/
 ├── docs/
 │   ├── context-management-design.md  # 上下文管理设计文档
 │   ├── plan-mode.md                  # Plan Mode 设计文档
-│   └── mcp.md                        # MCP 集成设计文档
+│   ├── mcp.md                        # MCP 集成设计文档
+│   └── streaming-tool-execution.md   # 流式工具并发执行设计文档
 ├── package.json
 ├── tsconfig.json
 └── .env                       # API_KEY, API_BASE_URL, MODEL

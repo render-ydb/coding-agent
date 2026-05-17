@@ -29,6 +29,7 @@ import {
   toolDefinitions,
   executeTool,
   checkPermission,
+  CONCURRENCY_SAFE_TOOLS,
   type PermissionMode,
   type PermissionResult,
 } from './tools/index.js';
@@ -57,6 +58,21 @@ export type { PermissionMode } from './tools/index.js';
 // ─────────────────────────────────────────────────────────
 // 类型
 // ─────────────────────────────────────────────────────────
+
+/**
+ * 流式完成的 tool_use block 的轻量表示
+ *
+ * 与 Anthropic.ToolUseBlock 不同，不要求 caller 等字段。
+ * 在流式响应的 content_block_stop 事件中构造，仅携带
+ * 提前执行所需的最小信息：id（关联 earlyExecutions）、
+ * name（判断是否并发安全）、input（工具参数）。
+ */
+interface StreamedToolUseBlock {
+  type: 'tool_use';
+  id: string;
+  name: string;
+  input: Record<string, any>;
+}
 
 /**
  * Agent 构造参数
@@ -835,8 +851,34 @@ export class Agent {
 
         this.runCompressionPipeline();
 
+        // ── 流式工具并发执行 ──
+        // 在 API 流式响应期间，每当一个并发安全工具的 content block 完成，
+        // 立即启动该工具的执行（不等待整个响应结束）。
+        // earlyExecutions 存储已启动的 Promise，在后续工具执行循环中直接 await。
+        const earlyExecutions = new Map<string, Promise<string>>();
+
         // ── 调用 LLM（流式） ──
-        const response = await this.callApi();
+        const response = await this.callApi((block) => {
+          const input = block.input as Record<string, any>;
+          // 仅对并发安全工具（无副作用的只读工具）启用提前执行
+          if (CONCURRENCY_SAFE_TOOLS.has(block.name)) {
+            const perm = checkPermission(
+              block.name,
+              input,
+              this.permissionMode,
+              this.planFilePath || undefined,
+            );
+            // 仅 action=allow 时提前执行（需确认或被拒绝的不提前启动）
+            if (perm.action === 'allow') {
+              earlyExecutions.set(
+                block.id,
+                Promise.resolve(
+                  executeTool(block.name, input, this.readFileState),
+                ),
+              );
+            }
+          }
+        });
 
         // 记录 token 用量
         this.totalInputTokens += response.usage.input_tokens;
@@ -870,6 +912,20 @@ export class Agent {
 
           const input = toolUse.input as Record<string, any>;
           printToolCall(toolUse.name, input);
+
+          // ── 流式提前执行：如果该工具已在流式阶段启动，直接消费结果 ──
+          const earlyPromise = earlyExecutions.get(toolUse.id);
+          if (earlyPromise) {
+            const raw = await earlyPromise;
+            const result = this.persistLargeResult(toolUse.name, raw);
+            printToolResult(toolUse.name, result);
+            toolResults.push({
+              type: 'tool_result',
+              tool_use_id: toolUse.id,
+              content: result,
+            });
+            continue;
+          }
 
           // 拦截 plan mode 工具（由 Agent 内部处理，不走常规工具路由）
           if (
@@ -1034,6 +1090,13 @@ export class Agent {
    *
    * 流式打印文本内容给用户，最终返回完整 Message 对象。
    *
+   * 流式工具执行（Streaming Tool Execution）：
+   * 当提供 onToolBlockComplete 回调时，每当一个 tool_use content block
+   * 在流式传输中完成（content_block_stop 事件），立即触发回调。
+   * 调用方可在回调中启动工具执行，使其与后续 block 的流式传输并发进行。
+   * 通过 toolBlocksByIndex Map 追踪每个 tool_use block 的流式 JSON 输入，
+   * 在 block 结束时解析完整 JSON 并构造 ToolUseBlock 对象传给回调。
+   *
    * Extended Thinking 处理：
    * 当 thinkingMode 不为 "disabled" 时：
    * 1. max_tokens 使用模型特定的最大值（而非固定 16384）
@@ -1045,8 +1108,13 @@ export class Agent {
    * - thinking 是模型的中间推理过程，不是对用户的回答
    * - 存入历史会占用大量上下文空间
    * - Anthropic API 在后续轮次中也不期望收到 thinking blocks
+   *
+   * @param onToolBlockComplete 可选回调，每个 tool_use block 流式完成时触发。
+   *                            调用方据此在响应未结束前就启动并发安全工具的执行。
    */
-  private async callApi(): Promise<Anthropic.Message> {
+  private async callApi(
+    onToolBlockComplete?: (block: StreamedToolUseBlock) => void,
+  ): Promise<Anthropic.Message> {
     return withRetry(async (signal) => {
       // 根据 thinking 模式决定 max_tokens
       const maxOutput = getMaxOutputTokens(this.model);
@@ -1082,12 +1150,19 @@ export class Agent {
         printAssistantText(text);
       });
 
-      // 流式输出思考过程（通过底层 streamEvent 监听）
-      // SDK 的高级 "text" 事件只覆盖 text 类型的 content block，
-      // thinking 类型的 block 需要通过 streamEvent 手动处理。
+      // ── 统一 streamEvent 处理器：thinking 输出 + tool_use block 追踪 ──
+      //
+      // 追踪进行中的 tool_use block：按流式事件的 index 分组，
+      // 逐步累积 input_json_delta 中的 JSON 片段。
+      // 当 content_block_stop 触发时，解析完整 JSON 并通知调用方。
+      const toolBlocksByIndex = new Map<
+        number,
+        { id: string; name: string; inputJson: string }
+      >();
       let inThinking = false;
+
       stream.on('streamEvent' as any, (event: any) => {
-        // thinking block 开始：打印标记，进入思考状态
+        // ── thinking block 处理 ──
         if (
           event.type === 'content_block_start' &&
           event.content_block?.type === 'thinking'
@@ -1097,9 +1172,7 @@ export class Agent {
             stopSpinner();
             printThinkingStart();
           }
-        }
-        // thinking 增量内容：流式输出思考文本
-        else if (
+        } else if (
           event.type === 'content_block_delta' &&
           event.delta?.type === 'thinking_delta' &&
           inThinking
@@ -1107,10 +1180,51 @@ export class Agent {
           printThinkingDelta(event.delta.thinking);
         }
 
-        // content block 结束：如果在思考中，结束思考输出
-        if (event.type === 'content_block_stop' && inThinking) {
-          printThinkingEnd();
-          inThinking = false;
+        // ── tool_use block 追踪：记录新 block 的 id 和 name ──
+        if (
+          event.type === 'content_block_start' &&
+          event.content_block?.type === 'tool_use'
+        ) {
+          toolBlocksByIndex.set(event.index, {
+            id: event.content_block.id,
+            name: event.content_block.name,
+            inputJson: '',
+          });
+        }
+
+        // ── tool_use block 追踪：累积 JSON 输入片段 ──
+        if (
+          event.type === 'content_block_delta' &&
+          event.delta?.type === 'input_json_delta'
+        ) {
+          const tb = toolBlocksByIndex.get(event.index);
+          if (tb) tb.inputJson += event.delta.partial_json;
+        }
+
+        // ── content_block_stop：结束 thinking 或触发 tool 回调 ──
+        if (event.type === 'content_block_stop') {
+          if (inThinking) {
+            printThinkingEnd();
+            inThinking = false;
+          }
+
+          // 如果该 index 对应 tool_use block，解析累积的 JSON 并触发回调
+          const tb = toolBlocksByIndex.get(event.index);
+          if (tb && onToolBlockComplete) {
+            let parsedInput: Record<string, any> = {};
+            try {
+              parsedInput = JSON.parse(tb.inputJson || '{}');
+            } catch {
+              // JSON 解析失败时传空对象，不阻塞流式处理
+            }
+            onToolBlockComplete({
+              type: 'tool_use',
+              id: tb.id,
+              name: tb.name,
+              input: parsedInput,
+            });
+            toolBlocksByIndex.delete(event.index);
+          }
         }
       });
 

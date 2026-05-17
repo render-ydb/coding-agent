@@ -30,6 +30,30 @@ import { builtinTools } from './builtin/index.js';
 export { checkPermission } from './permissions.js';
 export type { PermissionMode, PermissionResult } from './permissions.js';
 
+// ─────────────────────────────────────────────────────────
+// 并发安全工具集合
+// ─────────────────────────────────────────────────────────
+
+/**
+ * 可在流式响应期间安全并发执行的工具集合
+ *
+ * 这些工具满足两个条件：
+ * 1. 无副作用 —— 纯读取操作，不修改文件系统或外部状态
+ * 2. 无顺序依赖 —— 多个工具的执行结果互不影响
+ *
+ * 当 API 流式返回多个 tool_use block 时，属于此集合的工具
+ * 会在 content_block_stop 事件触发时立即启动执行，
+ * 而非等待整个响应完成后再顺序执行。
+ *
+ * run_shell 虽然也常用于读取操作，但可能产生副作用（修改文件系统），
+ * 因此不纳入并发安全集合。
+ */
+export const CONCURRENCY_SAFE_TOOLS = new Set([
+  'read_file',
+  'list_files',
+  'grep_search',
+]);
+
 // ── Re-export 类型 ──
 export type { ToolDefinition } from './types.js';
 
