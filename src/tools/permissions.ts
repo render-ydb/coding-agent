@@ -83,12 +83,30 @@ const EDIT_TOOLS = new Set(['write_file', 'edit_file']);
 const PLAN_MODE_TOOLS = new Set(['enter_plan_mode', 'exit_plan_mode']);
 
 /**
+ * 权限检查结果
+ *
+ * 结构化返回值，包含动作和可选的描述信息：
+ * - action "allow":   直接执行，无需确认
+ * - action "confirm": 需要用户手动确认后才执行，message 为确认描述
+ * - action "deny":    直接拒绝，不执行，message 为拒绝原因
+ *
+ * 使用结构化对象而非简单字符串的好处：
+ * 1. 调用方无需自行拼装确认描述（如命令内容、文件路径）
+ * 2. deny 时可以携带拒绝原因，方便展示和调试
+ * 3. 扩展性强，未来可添加更多元数据（如规则来源）
+ */
+export interface PermissionResult {
+  action: 'allow' | 'confirm' | 'deny';
+  /** 确认描述（confirm 时）或拒绝原因（deny 时） */
+  message?: string;
+}
+
+/**
  * 统一权限检查函数
  *
- * 根据工具名、参数和当前权限模式，决定操作应该：
- * - "allow":   直接执行，无需确认
- * - "confirm": 需要用户手动确认后才执行
- * - "deny":    直接拒绝，不执行
+ * 根据工具名、参数和当前权限模式，决定操作应该放行、确认还是拒绝。
+ * 返回结构化结果 { action, message? }，message 携带上下文信息
+ * 供调用方直接用于展示或记录。
  *
  * 检查优先级（从高到低）：
  * 1. bypassPermissions 模式 → 全部放行
@@ -110,32 +128,44 @@ export function checkPermission(
   input: Record<string, any>,
   mode: PermissionMode,
   planFilePath?: string,
-): 'allow' | 'confirm' | 'deny' {
-  if (mode === 'bypassPermissions') return 'allow';
+): PermissionResult {
+  if (mode === 'bypassPermissions') return { action: 'allow' };
 
-  if (READ_ONLY_TOOLS.has(toolName)) return 'allow';
+  if (READ_ONLY_TOOLS.has(toolName)) return { action: 'allow' };
 
   // plan mode 工具（enter/exit）在任何模式下都允许
-  if (PLAN_MODE_TOOLS.has(toolName)) return 'allow';
+  if (PLAN_MODE_TOOLS.has(toolName)) return { action: 'allow' };
 
   // plan 模式：仅允许编辑 plan 文件，其他写操作全部拒绝
   if (mode === 'plan') {
     if (EDIT_TOOLS.has(toolName)) {
       const filePath = input.file_path || input.path;
-      if (planFilePath && filePath === planFilePath) return 'allow';
+      if (planFilePath && filePath === planFilePath) return { action: 'allow' };
+      return { action: 'deny', message: `Blocked in plan mode: ${toolName} on ${filePath}` };
     }
-    return 'deny';
+    if (toolName === 'run_shell') {
+      return { action: 'deny', message: 'Shell commands blocked in plan mode' };
+    }
+    return { action: 'deny', message: `Blocked in plan mode: ${toolName}` };
   }
 
-  if (mode === 'acceptEdits' && EDIT_TOOLS.has(toolName)) return 'allow';
+  if (mode === 'acceptEdits' && EDIT_TOOLS.has(toolName)) return { action: 'allow' };
 
+  // 危险 shell 命令：需确认或自动拒绝
   if (toolName === 'run_shell' && isDangerous(input.command)) {
-    return mode === 'dontAsk' ? 'deny' : 'confirm';
+    if (mode === 'dontAsk') {
+      return { action: 'deny', message: `Auto-denied (dontAsk mode): ${input.command}` };
+    }
+    return { action: 'confirm', message: input.command };
   }
 
+  // 写入不存在的文件：需确认或自动拒绝
   if (toolName === 'write_file' && !existsSync(input.file_path)) {
-    return mode === 'dontAsk' ? 'deny' : 'confirm';
+    if (mode === 'dontAsk') {
+      return { action: 'deny', message: `Auto-denied (dontAsk mode): write new file ${input.file_path}` };
+    }
+    return { action: 'confirm', message: `write new file: ${input.file_path}` };
   }
 
-  return 'allow';
+  return { action: 'allow' };
 }

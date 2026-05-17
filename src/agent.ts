@@ -30,6 +30,7 @@ import {
   executeTool,
   checkPermission,
   type PermissionMode,
+  type PermissionResult,
 } from './tools/index.js';
 import { McpManager } from './mcp.js';
 import { saveSession, type SessionData } from './session.js';
@@ -934,27 +935,26 @@ export class Agent {
           }
 
           // 权限检查（传入 planFilePath 以支持 plan 文件白名单）
+          // 返回结构化结果 { action, message? }，message 携带确认描述或拒绝原因
           const perm = checkPermission(
             toolUse.name,
             input,
             this.permissionMode,
             this.planFilePath || undefined,
           );
-          if (perm === 'deny') {
+          if (perm.action === 'deny') {
             printDenied(this.permissionMode);
             toolResults.push({
               type: 'tool_result',
               tool_use_id: toolUse.id,
-              content: 'Action denied by permission mode.',
+              content: `Action denied: ${perm.message || 'permission mode'}`,
             });
             continue;
           }
-          if (perm === 'confirm') {
-            const desc =
-              toolUse.name === 'run_shell' ? input.command : input.file_path;
+          if (perm.action === 'confirm' && perm.message) {
             // 会话白名单：已确认过的路径/命令自动放行
-            if (!this.confirmedPaths.has(desc)) {
-              const allowed = await this.confirm(`Allow: ${desc}`);
+            if (!this.confirmedPaths.has(perm.message)) {
+              const allowed = await this.confirm(`Allow: ${perm.message}`);
               if (!allowed) {
                 toolResults.push({
                   type: 'tool_result',
@@ -963,7 +963,7 @@ export class Agent {
                 });
                 continue;
               }
-              this.confirmedPaths.add(desc);
+              this.confirmedPaths.add(perm.message);
             }
           }
 

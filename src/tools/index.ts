@@ -28,7 +28,7 @@ import { builtinTools } from './builtin/index.js';
 
 // ── Re-export 权限相关 ──
 export { checkPermission } from './permissions.js';
-export type { PermissionMode } from './permissions.js';
+export type { PermissionMode, PermissionResult } from './permissions.js';
 
 // ── Re-export 类型 ──
 export type { ToolDefinition } from './types.js';
