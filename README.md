@@ -4,15 +4,17 @@
 
 实现了经典的 **Tool-Use Agent Loop**：用户输入 → LLM 决策 → 调用工具 → 执行工具 → 返回结果 → 循环直到完成。
 
+支持**双后端**：Anthropic Messages API 和 OpenAI Chat Completions API（兼容 OpenAI、Ollama、vLLM 等）。
+
 ```
-┌──────────┐     ┌──────────┐     ┌──────────┐
-│  用户    │ ──> │  Agent   │ ──> │ Anthropic│
-│  (CLI)   │ <── │  Loop    │ <── │  API     │
-└──────────┘     └────┬─────┘     └──────────┘
-                      │
-                 ┌────▼─────┐
-                 │  Tools   │
-                 └──────────┘
+┌──────────┐     ┌──────────────┐     ┌──────────────────┐
+│  用户    │ ──> │   Agent      │ ──> │ Anthropic API    │
+│  (CLI)   │ <── │   (路由层)   │ ──> │ 或 OpenAI API    │
+└──────────┘     └──────┬───────┘     └──────────────────┘
+                        │
+                   ┌────▼─────┐
+                   │  Tools   │
+                   └──────────┘
 ```
 
 ## 快速开始
@@ -39,12 +41,13 @@ npm run build && npm start
 | 功能 | 说明 | 代码位置 |
 |------|------|---------|
 | Tool-Use Agent Loop | 用户输入 → LLM → tool_use → 执行 → tool_result → 循环 | `src/agent.ts` `chat()` |
-| 流式响应 | 通过 Anthropic Streaming API 实时输出文本 | `src/agent.ts` `callApi()` |
+| 双后端支持 | 同时支持 Anthropic Messages API 和 OpenAI Chat Completions API | `src/agent.ts` |
+| 流式响应 | 通过 Anthropic/OpenAI Streaming API 实时输出文本 | `src/agent.ts` `callApi()` / `callOpenAIStream()` |
 | 中断支持 | Ctrl+C 通过 AbortController 中断正在进行的 API 请求 | `src/agent.ts` `abort()` |
 | 预算控制 | 支持最大花费（美元）和最大轮次限制，超出自动停止 | `src/agent.ts` `isBudgetExceeded()` |
 | Token 统计 | 累计输入/输出 token 计数和费用估算 | `src/agent.ts` `getTokenUsage()` |
-| Extended Thinking | 模型内部推理链，支持 adaptive/enabled 两种模式 | `src/agent.ts` `callApi()` |
-| 流式工具并发执行 | tool_use block 流式完成时立即启动只读工具，与后续 block 传输并行 | `src/agent.ts` `callApi()` |
+| Extended Thinking | 模型内部推理链，支持 adaptive/enabled 两种模式（仅 Anthropic） | `src/agent.ts` `callApi()` |
+| 流式工具并发执行 | tool_use block 流式完成时立即启动只读工具（仅 Anthropic） | `src/agent.ts` `callApi()` |
 
 ### 工具系统
 
@@ -279,6 +282,56 @@ coding-agent --thinking --yolo "重构这个函数并解释你的推理过程"
 
 详细设计文档见 [docs/streaming-tool-execution.md](docs/streaming-tool-execution.md)。
 
+### OpenAI 兼容后端
+
+支持通过 OpenAI Chat Completions API 接入 OpenAI、Ollama、vLLM 等服务，实现与 Anthropic 后端完全对等的功能（Extended Thinking 和流式工具提前执行除外）。
+
+**配置示例：**
+
+```bash
+# OpenAI
+BACKEND=openai
+API_BASE_URL=https://api.openai.com/v1
+API_KEY=sk-xxx
+MODEL=gpt-4o
+
+# Ollama（URL 含 ollama 时自动检测）
+API_BASE_URL=http://localhost:11434/v1
+API_KEY=ollama
+MODEL=llama3
+```
+
+**双后端功能实现对比：**
+
+| 功能 | Anthropic 后端 | OpenAI 后端 |
+|------|:---:|:---:|
+| 流式文本输出 | ✅ | ✅ |
+| 工具调用 | ✅ | ✅ |
+| 流式工具提前执行 | ✅ (content_block_stop) | ❌ (用 Phase 1/2 替代) |
+| Extended Thinking | ✅ | ❌ (模型不支持) |
+| 多层压缩管道 | ✅ | ✅ |
+| 对话摘要压缩 | ✅ | ✅ |
+| Memory 语义召回 | ✅ | ✅ |
+| MCP 工具 | ✅ | ✅ |
+| Sub-Agent | ✅ | ✅ |
+| Skill (fork/inline) | ✅ | ✅ |
+| Plan Mode | ✅ | ✅ |
+| Session 持久化 | ✅ | ✅ |
+| 预算控制 | ✅ | ✅ |
+
+**关键实现：**
+
+| 组件 | 说明 |
+|------|------|
+| `toOpenAITools()` | Anthropic.Tool → OpenAI 格式动态转换 |
+| `chatOpenAI()` | OpenAI Agent Loop（Phase 1/2 工具执行模式） |
+| `callOpenAIStream()` | 流式响应收集，组装为 ChatCompletion |
+| `executeInternalTool()` | 内部工具统一路由（两后端共用） |
+| `compactOpenAI()` | OpenAI 格式的对话摘要压缩 |
+| OpenAI 压缩管道 | `budgetToolResultsOpenAI` / `snipStaleResultsOpenAI` / `microcompactOpenAI` |
+
+详细设计文档见 [docs/openai-backend.md](docs/openai-backend.md)。
+
 ### MCP 集成（外部工具扩展）
 
 通过 MCP（Model Context Protocol）协议接入外部工具生态，让 Agent 能力不再局限于内置工具。
@@ -362,7 +415,7 @@ coding-agent
 coding-agent/
 ├── src/
 │   ├── index.ts              # CLI 入口：参数解析、REPL 循环、.env 配置加载
-│   ├── agent.ts              # 核心引擎：Agent Loop、流式响应、上下文压缩、Sub-Agent
+│   ├── agent.ts              # 核心引擎：双后端 Agent Loop、流式响应、上下文压缩、Sub-Agent
 │   ├── subagent.ts           # Sub-Agent 配置：类型定义、系统提示、工具集过滤
 │   ├── memory.ts             # 记忆系统：CRUD、语义召回、预取、系统提示
 │   ├── frontmatter.ts        # YAML frontmatter 解析器（被 memory.ts 依赖）
@@ -392,7 +445,8 @@ coding-agent/
 │   ├── plan-mode.md                  # Plan Mode 设计文档
 │   ├── mcp.md                        # MCP 集成设计文档
 │   ├── streaming-tool-execution.md   # 流式工具并发执行设计文档
-│   └── deferred-tools.md            # 动态工具过滤设计文档
+│   ├── deferred-tools.md            # 动态工具过滤设计文档
+│   └── openai-backend.md            # OpenAI 兼容后端设计文档
 ├── package.json
 ├── tsconfig.json
 └── .env                       # API_KEY, API_BASE_URL, MODEL
@@ -403,12 +457,21 @@ coding-agent/
 在项目根目录创建 `.env` 文件：
 
 ```env
+# Anthropic 后端（默认）
 API_KEY=your-api-key
-API_BASE_URL=https://your-api-endpoint/v1
+API_BASE_URL=https://api.anthropic.com/v1
 MODEL=claude-sonnet-4-6
+
+# 或 OpenAI 兼容后端
+# BACKEND=openai
+# API_KEY=sk-xxx
+# API_BASE_URL=https://api.openai.com/v1
+# MODEL=gpt-4o
 ```
 
-Agent 同时发送 `x-api-key` 和 `Authorization: Bearer` 请求头，兼容 Anthropic 官方 API 和 litellm 等代理网关。
+- **Anthropic 模式**：同时发送 `x-api-key` 和 `Authorization: Bearer` 请求头，兼容官方 API 和 litellm 等代理网关
+- **OpenAI 模式**：通过标准 OpenAI SDK 连接，兼容所有 OpenAI Chat Completions API 兼容服务
+- **自动检测**：未设置 `BACKEND` 时，从 URL 和模型名自动推断后端类型
 
 ## 技术栈
 
@@ -416,7 +479,7 @@ Agent 同时发送 `x-api-key` 和 `Authorization: Bearer` 请求头，兼容 An
 |------|------|
 | 运行时 | Node.js |
 | 语言 | TypeScript（严格模式） |
-| LLM SDK | `@anthropic-ai/sdk` |
+| LLM SDK | `@anthropic-ai/sdk` + `openai`（双后端） |
 | 环境变量 | `dotenv` |
 | 构建 | `tsc`（ESM 模块） |
 | 开发 | `tsx`（免构建运行） |

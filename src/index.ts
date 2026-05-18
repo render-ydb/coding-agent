@@ -163,17 +163,26 @@ function parseArgs(): ParsedArgs {
 /**
  * API 配置结构
  *
- * 直接从 .env 文件读取，只需要两个字段：
+ * 直接从 .env 文件读取：
  * - API_KEY:      API 密钥
  * - API_BASE_URL: API 端点地址
+ * - MODEL:        模型标识符
+ * - BACKEND:      （可选）强制指定后端类型 'anthropic' | 'openai'
  */
 interface ApiConfig {
   /** API 密钥 */
   apiKey: string;
   /** API 端点 URL */
   apiBaseUrl: string;
-  /** 模型标识符（如 openai/gpt-4o） */
+  /** 模型标识符（如 claude-sonnet-4-6 或 gpt-4o） */
   model: string;
+  /**
+   * 后端类型
+   *
+   * 决定使用 Anthropic Messages API 还是 OpenAI Chat Completions API。
+   * 可通过环境变量 BACKEND 显式指定，未指定时根据 URL 和模型名自动推断。
+   */
+  backend: 'anthropic' | 'openai';
 }
 
 /**
@@ -181,6 +190,11 @@ interface ApiConfig {
  *
  * 通过文件顶部的 import "dotenv/config" 已自动将 .env 加载到 process.env，
  * 这里直接读取即可，缺少任一字段则返回 null。
+ *
+ * 后端检测优先级：
+ * 1. 环境变量 BACKEND 显式指定
+ * 2. URL / 模型名启发式推断
+ * 3. 默认 anthropic（向后兼容）
  *
  * @returns API 配置对象，或 null（缺少必要配置）
  */
@@ -191,7 +205,39 @@ function loadApiConfig(): ApiConfig | null {
 
   if (!apiKey || !apiBaseUrl || !model) return null;
 
-  return { apiKey, apiBaseUrl, model };
+  // 检测后端类型
+  const backendEnv = process.env.BACKEND?.trim()?.toLowerCase();
+  let backend: 'anthropic' | 'openai';
+
+  if (backendEnv === 'openai') {
+    backend = 'openai';
+  } else if (backendEnv === 'anthropic') {
+    backend = 'anthropic';
+  } else {
+    // 启发式推断：从 URL 和模型名判断
+    const urlLower = apiBaseUrl.toLowerCase();
+    const modelLower = model.toLowerCase();
+    if (
+      urlLower.includes('anthropic') ||
+      modelLower.startsWith('claude') ||
+      modelLower.includes('/claude')
+    ) {
+      backend = 'anthropic';
+    } else if (
+      urlLower.includes('openai.com') ||
+      urlLower.includes('ollama') ||
+      urlLower.includes('vllm') ||
+      modelLower.startsWith('gpt-') ||
+      modelLower.startsWith('o1') ||
+      modelLower.startsWith('o3')
+    ) {
+      backend = 'openai';
+    } else {
+      backend = 'anthropic';
+    }
+  }
+
+  return { apiKey, apiBaseUrl, model, backend };
 }
 
 // ─────────────────────────────────────────────────────────
@@ -507,10 +553,11 @@ async function main(): Promise<void> {
     apiKey: apiConfig.apiKey,
     apiBaseUrl: apiConfig.apiBaseUrl,
     model: apiConfig.model,
+    backend: apiConfig.backend,
   });
 
   printInfo(
-    `Config: model=${apiConfig.model}, mode=${config.permissionMode}, api=${apiConfig.apiBaseUrl}` +
+    `Config: model=${apiConfig.model}, mode=${config.permissionMode}, backend=${apiConfig.backend}, api=${apiConfig.apiBaseUrl}` +
       (config.thinking ? ', thinking=on' : '') +
       (config.maxCost ? `, budget=$${config.maxCost}` : '') +
       (config.maxTurns ? `, maxTurns=${config.maxTurns}` : '') +

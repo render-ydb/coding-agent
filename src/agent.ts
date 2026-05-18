@@ -6,13 +6,14 @@
  *   用户输入 → 发送给 LLM → LLM 返回文本或 tool_use → 执行工具
  *   → 将工具结果返回 LLM → 循环直到 LLM 不再调用工具
  *
- * 使用 Anthropic SDK（Messages API），通过 baseURL 支持代理/网关。
+ * 支持双后端：Anthropic Messages API 和 OpenAI Chat Completions API。
+ * 通过 backend 选项或自动检测决定使用哪个后端。
  *
  * 架构概览：
- * ┌──────────┐     ┌──────────┐     ┌──────────┐
- * │  用户    │ ──> │  Agent   │ ──> │ Anthropic│
- * │  (CLI)   │ <── │  Loop    │ <── │  API     │
- * └──────────┘     └────┬─────┘     └──────────┘
+ * ┌──────────┐     ┌──────────┐     ┌──────────────────┐
+ * │  用户    │ ──> │  Agent   │ ──> │ Anthropic API    │
+ * │  (CLI)   │ <── │  Loop    │ <── │ 或 OpenAI API    │
+ * └──────────┘     └────┬─────┘     └──────────────────┘
  *                       │
  *                  ┌────▼─────┐
  *                  │  Tools   │
@@ -21,6 +22,7 @@
  */
 
 import Anthropic from '@anthropic-ai/sdk';
+import OpenAI from 'openai';
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'fs';
 import { join } from 'path';
 import { homedir } from 'os';
@@ -118,6 +120,12 @@ export interface AgentOptions {
   customTools?: Anthropic.Tool[];
   /** 标记为子 Agent（跳过 MCP 初始化、memory prefetch、autoSave） */
   isSubAgent?: boolean;
+  /**
+   * 后端类型：'anthropic' 使用 Anthropic Messages API，
+   * 'openai' 使用 OpenAI Chat Completions API。
+   * 默认 'anthropic'，保持向后兼容。
+   */
+  backend?: 'anthropic' | 'openai';
 }
 
 // ─────────────────────────────────────────────────────────
@@ -388,6 +396,29 @@ const MICROCOMPACT_IDLE_MS = 5 * 60 * 1000;
 const KEEP_RECENT_RESULTS = 3;
 
 // ─────────────────────────────────────────────────────────
+// OpenAI 工具格式转换
+// ─────────────────────────────────────────────────────────
+
+/**
+ * 将 Anthropic.Tool[] 转换为 OpenAI 工具定义格式
+ *
+ * Anthropic 格式: { name, description, input_schema }
+ * OpenAI 格式:    { type: "function", function: { name, description, parameters } }
+ *
+ * 在每次 callOpenAIStream() 调用时转换，确保使用最新的 activeToolDefinitions。
+ */
+function toOpenAITools(tools: Anthropic.Tool[]): OpenAI.ChatCompletionTool[] {
+  return tools.map((t) => ({
+    type: 'function' as const,
+    function: {
+      name: t.name,
+      description: t.description || '',
+      parameters: t.input_schema as Record<string, unknown>,
+    },
+  }));
+}
+
+// ─────────────────────────────────────────────────────────
 // Agent 类
 // ─────────────────────────────────────────────────────────
 
@@ -408,26 +439,53 @@ const KEEP_RECENT_RESULTS = 3;
  * - 通过 abort() 方法中断正在进行的请求
  */
 export class Agent {
-  /** Anthropic SDK 客户端实例 */
-  private client: Anthropic;
-  /** 模型标识符（如 anthropic/claude-opus-4.6） */
+  // ── 后端选择 ──
+  /**
+   * 是否使用 OpenAI 兼容后端
+   *
+   * true: 使用 OpenAI Chat Completions API（openaiClient + openaiMessages）
+   * false: 使用 Anthropic Messages API（client + anthropicMessages）
+   */
+  private useOpenAI: boolean;
+
+  /** Anthropic SDK 客户端实例（Anthropic 模式时初始化） */
+  private client!: Anthropic;
+  /** OpenAI SDK 客户端实例（OpenAI 模式时初始化） */
+  private openaiClient?: OpenAI;
+
+  /** 模型标识符（如 anthropic/claude-opus-4.6 或 gpt-4o） */
   private model: string;
   /** 系统提示词（构造时生成，整个会话不变） */
   private systemPrompt: string;
+
   /**
-   * 对话历史
+   * Anthropic 格式的对话历史
    *
    * Anthropic Messages API 的消息格式：
    * - { role: "user", content: string | ContentBlock[] }
    * - { role: "assistant", content: ContentBlock[] }
    *
-   * 关键区别于 OpenAI：
+   * 特点：
    * 1. 没有 "system" role —— system prompt 通过独立参数传入
-   * 2. tool_result 放在 user 消息中（而非 OpenAI 的独立 "tool" role）
+   * 2. tool_result 放在 user 消息中（而非独立 role）
    * 3. 消息必须严格交替：user → assistant → user → assistant ...
-   *    工具执行完后的 tool_result 以 user 消息形式发送，天然维持交替
+   *
+   * 仅 useOpenAI=false 时使用。
    */
-  private messages: Anthropic.MessageParam[] = [];
+  private anthropicMessages: Anthropic.MessageParam[] = [];
+
+  /**
+   * OpenAI 格式的对话历史
+   *
+   * OpenAI Chat Completions API 的消息格式：
+   * - { role: "system", content: systemPrompt } （首条消息）
+   * - { role: "user", content: string }
+   * - { role: "assistant", content: string, tool_calls?: [...] }
+   * - { role: "tool", tool_call_id: string, content: string }
+   *
+   * 仅 useOpenAI=true 时使用。
+   */
+  private openaiMessages: OpenAI.ChatCompletionMessageParam[] = [];
   /** 当前权限模式 */
   private permissionMode: PermissionMode;
   /** 用户是否请求了扩展思考（--thinking 开关） */
@@ -698,21 +756,31 @@ export class Agent {
   /**
    * 构造 Agent 实例
    *
-   * baseURL 处理：Anthropic SDK 内部拼接 "/v1/messages"，
-   * 所以去掉用户 URL 中已有的 "/v1" 避免重复。
-   *
-   * 认证处理：同时发送 x-api-key 和 Authorization: Bearer，
-   * 确保兼容 Anthropic 官方 API 和 litellm 等代理。
+   * 双后端初始化逻辑：
+   * - Anthropic 模式：baseURL 去掉 "/v1" 后缀（SDK 内部拼接 "/v1/messages"），
+   *   同时发送 x-api-key 和 Authorization: Bearer 兼容代理。
+   * - OpenAI 模式：直接传入 baseURL 和 apiKey 给 OpenAI SDK，
+   *   system prompt 作为 messages[0] 插入。
    */
   constructor(options: AgentOptions) {
+    this.useOpenAI = options.backend === 'openai';
     const baseURL = options.apiBaseUrl.replace(/\/v1\/?$/, '');
-    this.client = new Anthropic({
-      apiKey: options.apiKey,
-      baseURL,
-      defaultHeaders: {
-        Authorization: `Bearer ${options.apiKey}`,
-      },
-    });
+
+    if (this.useOpenAI) {
+      this.openaiClient = new OpenAI({
+        baseURL: options.apiBaseUrl,
+        apiKey: options.apiKey,
+      });
+    } else {
+      this.client = new Anthropic({
+        apiKey: options.apiKey,
+        baseURL,
+        defaultHeaders: {
+          Authorization: `Bearer ${options.apiKey}`,
+        },
+      });
+    }
+
     this.model = options.model;
     this.permissionMode = options.permissionMode || 'default';
     this.thinking = options.thinking || false;
@@ -745,6 +813,11 @@ export class Agent {
       } else {
         this.systemPrompt = this.baseSystemPrompt;
       }
+    }
+
+    // OpenAI 模式下 system prompt 作为 messages[0] 插入
+    if (this.useOpenAI) {
+      this.openaiMessages.push({ role: 'system', content: this.systemPrompt });
     }
   }
 
@@ -802,6 +875,10 @@ export class Agent {
       this.prePlanMode = null;
       this.planFilePath = null;
       this.systemPrompt = this.baseSystemPrompt;
+      // OpenAI 模式下同步更新 messages[0] 中的 system prompt
+      if (this.useOpenAI && this.openaiMessages.length > 0) {
+        (this.openaiMessages[0] as any).content = this.systemPrompt;
+      }
       printInfo(`Exited plan mode → ${this.permissionMode} mode`);
       return this.permissionMode;
     } else {
@@ -809,6 +886,9 @@ export class Agent {
       this.permissionMode = 'plan';
       this.planFilePath = this.generatePlanFilePath();
       this.systemPrompt = this.baseSystemPrompt + this.buildPlanModePrompt();
+      if (this.useOpenAI && this.openaiMessages.length > 0) {
+        (this.openaiMessages[0] as any).content = this.systemPrompt;
+      }
       printInfo(`Entered plan mode. Plan file: ${this.planFilePath}`);
       return 'plan';
     }
@@ -849,6 +929,29 @@ export class Agent {
    * - 这是后台异步调用，不需要向用户展示中间结果
    */
   private buildSideQuery(): SideQueryFn {
+    if (this.useOpenAI) {
+      const client = this.openaiClient!;
+      const model = this.model;
+      return async (
+        system: string,
+        userMessage: string,
+        signal?: AbortSignal,
+      ): Promise<string> => {
+        const resp = await client.chat.completions.create(
+          {
+            model,
+            max_tokens: 256,
+            messages: [
+              { role: 'system', content: system },
+              { role: 'user', content: userMessage },
+            ],
+          },
+          { signal },
+        );
+        return resp.choices?.[0]?.message?.content || '';
+      };
+    }
+
     const client = this.client;
     const model = this.model;
     return async (
@@ -985,7 +1088,11 @@ export class Agent {
    * 确保新对话以干净的工具集开始（deferred 工具重新列入 system prompt 提示段）。
    */
   clearHistory(): void {
-    this.messages = [];
+    this.anthropicMessages = [];
+    this.openaiMessages = [];
+    if (this.useOpenAI) {
+      this.openaiMessages.push({ role: 'system', content: this.systemPrompt });
+    }
     this.totalInputTokens = 0;
     this.totalOutputTokens = 0;
     this.lastInputTokenCount = 0;
@@ -1031,7 +1138,11 @@ export class Agent {
    * @param data 从 loadSession() 获取的完整会话数据
    */
   restoreSession(data: SessionData): void {
-    this.messages = data.messages as Anthropic.MessageParam[];
+    if (data.openaiMessages) {
+      this.openaiMessages = data.openaiMessages as OpenAI.ChatCompletionMessageParam[];
+    } else if (data.messages) {
+      this.anthropicMessages = data.messages as Anthropic.MessageParam[];
+    }
     this.sessionId = data.metadata.id;
     this.sessionStartTime = data.metadata.startTime;
     printInfo(
@@ -1070,7 +1181,6 @@ export class Agent {
    *   ]
    */
   async chat(userMessage: string): Promise<void> {
-    this.messages.push({ role: 'user', content: userMessage });
     this.abortController = new AbortController();
 
     try {
@@ -1087,278 +1197,10 @@ export class Agent {
         }
       }
 
-      await this.checkAndCompact();
-
-      // ── 异步启动记忆预取（非阻塞，每个用户轮次触发一次）──
-      // 子 Agent 跳过 memory prefetch：无需独立的记忆召回
-      if (!this.isSubAgent) {
-        const sideQuery = this.buildSideQuery();
-        this.memoryPrefetch = startMemoryPrefetch(
-          userMessage,
-          sideQuery,
-          this.alreadySurfacedMemories,
-          this.sessionMemoryBytes,
-          this.abortController.signal,
-        );
-      }
-
-      while (true) {
-        if (this.abortController.signal.aborted) break;
-
-        this.runCompressionPipeline();
-
-        // ── 消费记忆预取结果（非阻塞轮询）──
-        // 每次循环迭代都检查，确保模型尽快看到召回的记忆。
-        // 记忆内容追加到最后一条 user 消息中，
-        // 避免连续 user 消息违反 Anthropic API 的交替规则。
-        if (
-          this.memoryPrefetch &&
-          this.memoryPrefetch.settled &&
-          !this.memoryPrefetch.consumed
-        ) {
-          this.memoryPrefetch.consumed = true;
-          try {
-            const memories = await this.memoryPrefetch.promise;
-            if (memories.length > 0) {
-              const injectionText = formatMemoriesForInjection(memories);
-              const last = this.messages[this.messages.length - 1];
-              if (last && last.role === 'user') {
-                if (typeof last.content === 'string') {
-                  last.content = last.content + '\n\n' + injectionText;
-                } else if (Array.isArray(last.content)) {
-                  (last.content as any[]).push({
-                    type: 'text',
-                    text: injectionText,
-                  });
-                }
-              } else {
-                this.messages.push({ role: 'user', content: injectionText });
-              }
-              for (const m of memories) {
-                this.alreadySurfacedMemories.add(m.path);
-                this.sessionMemoryBytes += Buffer.byteLength(m.content);
-              }
-            }
-          } catch {
-            /* 预取错误已在 memory.ts 中记录日志 */
-          }
-        }
-
-        // 子 Agent 不显示 spinner（避免与父 Agent 输出冲突）
-        if (!this.isSubAgent) startSpinner();
-
-        // ── 流式工具并发执行 ──
-        const earlyExecutions = new Map<string, Promise<string>>();
-
-        // ── 调用 LLM（流式） ──
-        const response = await this.callApi((block) => {
-          const input = block.input as Record<string, any>;
-          // 仅对并发安全工具（无副作用的只读工具）启用提前执行
-          if (CONCURRENCY_SAFE_TOOLS.has(block.name)) {
-            const perm = checkPermission(
-              block.name,
-              input,
-              this.permissionMode,
-              this.planFilePath || undefined,
-            );
-            // 仅 action=allow 时提前执行（需确认或被拒绝的不提前启动）
-            if (perm.action === 'allow') {
-              earlyExecutions.set(
-                block.id,
-                Promise.resolve(
-                  executeTool(block.name, input, this.readFileState),
-                ),
-              );
-            }
-          }
-        });
-
-        if (!this.isSubAgent) stopSpinner();
-
-        // 记录 token 用量
-        this.totalInputTokens += response.usage.input_tokens;
-        this.totalOutputTokens += response.usage.output_tokens;
-        this.lastInputTokenCount = response.usage.input_tokens;
-        this.lastApiCallTime = Date.now();
-
-        // 保存 assistant 响应到对话历史
-        this.messages.push({ role: 'assistant', content: response.content });
-
-        // 提取 tool_use blocks
-        const toolUses = response.content.filter(
-          (block): block is Anthropic.ToolUseBlock => block.type === 'tool_use',
-        );
-
-        // 无 tool_use → 对话结束
-        if (toolUses.length === 0) break;
-
-        // ── 执行工具 ──
-        this.currentTurns++;
-        if (this.isBudgetExceeded()) break;
-
-        const toolResults: Anthropic.ToolResultBlockParam[] = [];
-
-        // contextBreak 标志：当 plan 审批选择"清空上下文并执行"时，
-        // 需要跳出当前工具执行循环，让模型以全新上下文继续
-        let contextBreak = false;
-
-        for (const toolUse of toolUses) {
-          if (contextBreak || this.abortController.signal.aborted) break;
-
-          const input = toolUse.input as Record<string, any>;
-          printToolCall(toolUse.name, input);
-
-          // ── 流式提前执行：如果该工具已在流式阶段启动，直接消费结果 ──
-          const earlyPromise = earlyExecutions.get(toolUse.id);
-          if (earlyPromise) {
-            const raw = await earlyPromise;
-            const result = this.persistLargeResult(toolUse.name, raw);
-            printToolResult(toolUse.name, result);
-            toolResults.push({
-              type: 'tool_result',
-              tool_use_id: toolUse.id,
-              content: result,
-            });
-            continue;
-          }
-
-          // 拦截 plan mode 工具（由 Agent 内部处理，不走常规工具路由）
-          if (
-            toolUse.name === 'enter_plan_mode' ||
-            toolUse.name === 'exit_plan_mode'
-          ) {
-            const result = await this.executePlanModeTool(toolUse.name);
-            printToolResult(toolUse.name, result);
-
-            // 处理上下文清理：将结果以 user 消息注入而非 tool_result
-            if (this.contextCleared) {
-              this.contextCleared = false;
-              this.messages.push({ role: 'user', content: result });
-              contextBreak = true;
-              break;
-            }
-            toolResults.push({
-              type: 'tool_result',
-              tool_use_id: toolUse.id,
-              content: result,
-            });
-            continue;
-          }
-
-          // 拦截 agent 工具（由 Agent 内部处理，避免循环依赖）
-          // agent 工具派生子 Agent 实例，在独立上下文中执行任务
-          if (toolUse.name === 'agent') {
-            const result = await this.executeAgentTool(input);
-            printToolResult(toolUse.name, result);
-            toolResults.push({
-              type: 'tool_result',
-              tool_use_id: toolUse.id,
-              content: result,
-            });
-            continue;
-          }
-
-          // 拦截 skill 工具（由 Agent 内部处理，fork 模式需要创建子 Agent）
-          if (toolUse.name === 'skill') {
-            const result = await this.executeSkillTool(input);
-            printToolResult(toolUse.name, result);
-            toolResults.push({
-              type: 'tool_result',
-              tool_use_id: toolUse.id,
-              content: result,
-            });
-            continue;
-          }
-
-          // MCP 工具路由：检测 mcp__ 前缀的工具名，转发到对应的 MCP 服务器
-          if (this.mcpManager.isMcpTool(toolUse.name)) {
-            // Plan 模式下禁止 MCP 工具调用（plan 模式是只读的）
-            if (this.permissionMode === 'plan') {
-              printDenied(this.permissionMode);
-              toolResults.push({
-                type: 'tool_result',
-                tool_use_id: toolUse.id,
-                content: 'Action denied by permission mode.',
-              });
-              continue;
-            }
-
-            try {
-              const mcpResult = await this.mcpManager.callTool(
-                toolUse.name,
-                input,
-              );
-              const result = this.persistLargeResult(toolUse.name, mcpResult);
-              printToolResult(toolUse.name, result);
-              toolResults.push({
-                type: 'tool_result',
-                tool_use_id: toolUse.id,
-                content: result,
-              });
-            } catch (err: any) {
-              const errorMsg = `MCP tool error: ${err.message}`;
-              printToolResult(toolUse.name, errorMsg);
-              toolResults.push({
-                type: 'tool_result',
-                tool_use_id: toolUse.id,
-                content: errorMsg,
-                is_error: true,
-              });
-            }
-            continue;
-          }
-
-          // 权限检查（传入 planFilePath 以支持 plan 文件白名单）
-          // 返回结构化结果 { action, message? }，message 携带确认描述或拒绝原因
-          const perm = checkPermission(
-            toolUse.name,
-            input,
-            this.permissionMode,
-            this.planFilePath || undefined,
-          );
-          if (perm.action === 'deny') {
-            printDenied(this.permissionMode);
-            toolResults.push({
-              type: 'tool_result',
-              tool_use_id: toolUse.id,
-              content: `Action denied: ${perm.message || 'permission mode'}`,
-            });
-            continue;
-          }
-          if (perm.action === 'confirm' && perm.message) {
-            // 会话白名单：已确认过的路径/命令自动放行
-            if (!this.confirmedPaths.has(perm.message)) {
-              const allowed = await this.confirm(`Allow: ${perm.message}`);
-              if (!allowed) {
-                toolResults.push({
-                  type: 'tool_result',
-                  tool_use_id: toolUse.id,
-                  content: 'User denied this action.',
-                });
-                continue;
-              }
-              this.confirmedPaths.add(perm.message);
-            }
-          }
-
-          // 执行工具，传入 readFileState 以启用 read-before-edit 校验
-          const raw = executeTool(toolUse.name, input, this.readFileState);
-          const result = this.persistLargeResult(toolUse.name, raw);
-          printToolResult(toolUse.name, result);
-
-          toolResults.push({
-            type: 'tool_result',
-            tool_use_id: toolUse.id,
-            content: result,
-          });
-        }
-
-        // 工具结果作为 user 消息加入（Anthropic API 规定）
-        // contextBreak 时结果已单独注入，不再重复添加
-        if (!contextBreak && toolResults.length > 0) {
-          this.messages.push({ role: 'user', content: toolResults });
-        }
-        this.contextCleared = false;
+      if (this.useOpenAI) {
+        await this.chatOpenAI(userMessage);
+      } else {
+        await this.chatAnthropic(userMessage);
       }
     } finally {
       // 清理未消费的记忆预取：通过 abort 取消后台 sideQuery 请求
@@ -1372,6 +1214,497 @@ export class Agent {
         this.autoSave();
       }
     }
+  }
+
+  // ─── Anthropic 后端 Agent Loop ─────────────────────────
+
+  /**
+   * Anthropic 后端的 Agent Loop 实现
+   *
+   * 使用 Anthropic Messages API，特点：
+   * - tool_result 放在 user 消息中
+   * - 支持流式工具并发执行（content_block_stop 事件触发提前执行）
+   * - 支持 Extended Thinking
+   */
+  private async chatAnthropic(userMessage: string): Promise<void> {
+    this.anthropicMessages.push({ role: 'user', content: userMessage });
+    await this.checkAndCompact();
+
+    // 异步启动记忆预取
+    if (!this.isSubAgent) {
+      const sideQuery = this.buildSideQuery();
+      this.memoryPrefetch = startMemoryPrefetch(
+        userMessage,
+        sideQuery,
+        this.alreadySurfacedMemories,
+        this.sessionMemoryBytes,
+        this.abortController!.signal,
+      );
+    }
+
+    while (true) {
+      if (this.abortController!.signal.aborted) break;
+
+      this.runCompressionPipeline();
+
+      // 消费记忆预取结果
+      if (
+        this.memoryPrefetch &&
+        this.memoryPrefetch.settled &&
+        !this.memoryPrefetch.consumed
+      ) {
+        this.memoryPrefetch.consumed = true;
+        try {
+          const memories = await this.memoryPrefetch.promise;
+          if (memories.length > 0) {
+            const injectionText = formatMemoriesForInjection(memories);
+            const last = this.anthropicMessages[this.anthropicMessages.length - 1];
+            if (last && last.role === 'user') {
+              if (typeof last.content === 'string') {
+                last.content = last.content + '\n\n' + injectionText;
+              } else if (Array.isArray(last.content)) {
+                (last.content as any[]).push({ type: 'text', text: injectionText });
+              }
+            } else {
+              this.anthropicMessages.push({ role: 'user', content: injectionText });
+            }
+            for (const m of memories) {
+              this.alreadySurfacedMemories.add(m.path);
+              this.sessionMemoryBytes += Buffer.byteLength(m.content);
+            }
+          }
+        } catch { /* 预取错误已在 memory.ts 中记录 */ }
+      }
+
+      if (!this.isSubAgent) startSpinner();
+
+      // 流式工具并发执行
+      const earlyExecutions = new Map<string, Promise<string>>();
+
+      const response = await this.callApi((block) => {
+        const input = block.input as Record<string, any>;
+        if (CONCURRENCY_SAFE_TOOLS.has(block.name)) {
+          const perm = checkPermission(block.name, input, this.permissionMode, this.planFilePath || undefined);
+          if (perm.action === 'allow') {
+            earlyExecutions.set(block.id, Promise.resolve(executeTool(block.name, input, this.readFileState)));
+          }
+        }
+      });
+
+      if (!this.isSubAgent) stopSpinner();
+
+      this.totalInputTokens += response.usage.input_tokens;
+      this.totalOutputTokens += response.usage.output_tokens;
+      this.lastInputTokenCount = response.usage.input_tokens;
+      this.lastApiCallTime = Date.now();
+
+      this.anthropicMessages.push({ role: 'assistant', content: response.content });
+
+      const toolUses = response.content.filter(
+        (block): block is Anthropic.ToolUseBlock => block.type === 'tool_use',
+      );
+
+      if (toolUses.length === 0) break;
+
+      this.currentTurns++;
+      if (this.isBudgetExceeded()) break;
+
+      const toolResults: Anthropic.ToolResultBlockParam[] = [];
+      let contextBreak = false;
+
+      for (const toolUse of toolUses) {
+        if (contextBreak || this.abortController!.signal.aborted) break;
+
+        const input = toolUse.input as Record<string, any>;
+        printToolCall(toolUse.name, input);
+
+        // 流式提前执行
+        const earlyPromise = earlyExecutions.get(toolUse.id);
+        if (earlyPromise) {
+          const raw = await earlyPromise;
+          const result = this.persistLargeResult(toolUse.name, raw);
+          printToolResult(toolUse.name, result);
+          toolResults.push({ type: 'tool_result', tool_use_id: toolUse.id, content: result });
+          continue;
+        }
+
+        // 内部工具路由
+        const internalResult = await this.executeInternalTool(toolUse.name, input);
+        if (internalResult !== null) {
+          printToolResult(toolUse.name, internalResult);
+          if (this.contextCleared) {
+            this.contextCleared = false;
+            this.anthropicMessages.push({ role: 'user', content: internalResult });
+            contextBreak = true;
+            break;
+          }
+          toolResults.push({ type: 'tool_result', tool_use_id: toolUse.id, content: internalResult });
+          continue;
+        }
+
+        // 权限检查
+        const perm = checkPermission(toolUse.name, input, this.permissionMode, this.planFilePath || undefined);
+        if (perm.action === 'deny') {
+          printDenied(this.permissionMode);
+          toolResults.push({ type: 'tool_result', tool_use_id: toolUse.id, content: `Action denied: ${perm.message || 'permission mode'}` });
+          continue;
+        }
+        if (perm.action === 'confirm' && perm.message) {
+          if (!this.confirmedPaths.has(perm.message)) {
+            const allowed = await this.confirm(`Allow: ${perm.message}`);
+            if (!allowed) {
+              toolResults.push({ type: 'tool_result', tool_use_id: toolUse.id, content: 'User denied this action.' });
+              continue;
+            }
+            this.confirmedPaths.add(perm.message);
+          }
+        }
+
+        const raw = executeTool(toolUse.name, input, this.readFileState);
+        const result = this.persistLargeResult(toolUse.name, raw);
+        printToolResult(toolUse.name, result);
+        toolResults.push({ type: 'tool_result', tool_use_id: toolUse.id, content: result });
+      }
+
+      if (!contextBreak && toolResults.length > 0) {
+        this.anthropicMessages.push({ role: 'user', content: toolResults });
+      }
+      this.contextCleared = false;
+    }
+  }
+
+  // ─── OpenAI 后端 Agent Loop ──────────────────────────
+
+  /**
+   * OpenAI 兼容后端的 Agent Loop 实现
+   *
+   * 使用 OpenAI Chat Completions API，与 Anthropic 的主要区别：
+   * 1. 工具结果使用独立的 { role: "tool", tool_call_id, content } 消息
+   * 2. 没有原生流式工具执行，改用 Phase 1(串行权限检查) + Phase 2(并行执行) 模式
+   * 3. system prompt 在 messages[0] 而非独立参数
+   */
+  private async chatOpenAI(userMessage: string): Promise<void> {
+    this.openaiMessages.push({ role: 'user', content: userMessage });
+    await this.checkAndCompact();
+
+    // 异步启动记忆预取
+    if (!this.isSubAgent) {
+      const sideQuery = this.buildSideQuery();
+      this.memoryPrefetch = startMemoryPrefetch(
+        userMessage,
+        sideQuery,
+        this.alreadySurfacedMemories,
+        this.sessionMemoryBytes,
+        this.abortController!.signal,
+      );
+    }
+
+    while (true) {
+      if (this.abortController!.signal.aborted) break;
+
+      this.runCompressionPipeline();
+
+      // 消费记忆预取结果（OpenAI 格式）
+      if (
+        this.memoryPrefetch &&
+        this.memoryPrefetch.settled &&
+        !this.memoryPrefetch.consumed
+      ) {
+        this.memoryPrefetch.consumed = true;
+        try {
+          const memories = await this.memoryPrefetch.promise;
+          if (memories.length > 0) {
+            const injectionText = formatMemoriesForInjection(memories);
+            const last = this.openaiMessages[this.openaiMessages.length - 1];
+            if (last && last.role === 'user') {
+              (last as any).content = ((last as any).content || '') + '\n\n' + injectionText;
+            } else {
+              this.openaiMessages.push({ role: 'user', content: injectionText });
+            }
+            for (const m of memories) {
+              this.alreadySurfacedMemories.add(m.path);
+              this.sessionMemoryBytes += Buffer.byteLength(m.content);
+            }
+          }
+        } catch { /* 预取错误已在 memory.ts 中记录 */ }
+      }
+
+      if (!this.isSubAgent) startSpinner();
+
+      const response = await this.callOpenAIStream();
+
+      if (!this.isSubAgent) stopSpinner();
+      this.lastApiCallTime = Date.now();
+
+      if (response.usage) {
+        this.totalInputTokens += response.usage.prompt_tokens;
+        this.totalOutputTokens += response.usage.completion_tokens;
+        this.lastInputTokenCount = response.usage.prompt_tokens;
+      }
+
+      const choice = response.choices?.[0];
+      if (!choice) break;
+      const message = choice.message;
+
+      this.openaiMessages.push(message);
+
+      const toolCalls = message.tool_calls;
+      if (!toolCalls || toolCalls.length === 0) break;
+
+      this.currentTurns++;
+      if (this.isBudgetExceeded()) break;
+
+      // Phase 1: 串行权限检查
+      type CheckedCall = { tc: typeof toolCalls[0]; name: string; input: Record<string, any>; allowed: boolean; result?: string };
+      const checkedCalls: CheckedCall[] = [];
+
+      for (const tc of toolCalls) {
+        if (this.abortController!.signal.aborted) break;
+        if (tc.type !== 'function') continue;
+
+        const name = tc.function.name;
+        let input: Record<string, any>;
+        try { input = JSON.parse(tc.function.arguments); } catch { input = {}; }
+
+        printToolCall(name, input);
+
+        // 内部工具直接放行
+        if (this.isInternalTool(name)) {
+          checkedCalls.push({ tc, name, input, allowed: true });
+          continue;
+        }
+
+        const perm = checkPermission(name, input, this.permissionMode, this.planFilePath || undefined);
+        if (perm.action === 'deny') {
+          printDenied(this.permissionMode);
+          checkedCalls.push({ tc, name, input, allowed: false, result: `Action denied: ${perm.message}` });
+          continue;
+        }
+        if (perm.action === 'confirm' && perm.message && !this.confirmedPaths.has(perm.message)) {
+          const allowed = await this.confirm(`Allow: ${perm.message}`);
+          if (!allowed) {
+            checkedCalls.push({ tc, name, input, allowed: false, result: 'User denied this action.' });
+            continue;
+          }
+          this.confirmedPaths.add(perm.message);
+        }
+        checkedCalls.push({ tc, name, input, allowed: true });
+      }
+
+      // Phase 2: 并行执行安全工具，串行执行其余
+      type Batch = { concurrent: boolean; items: CheckedCall[] };
+      const batches: Batch[] = [];
+
+      for (const cc of checkedCalls) {
+        const safe = cc.allowed && CONCURRENCY_SAFE_TOOLS.has(cc.name);
+        if (safe && batches.length > 0 && batches[batches.length - 1].concurrent) {
+          batches[batches.length - 1].items.push(cc);
+        } else {
+          batches.push({ concurrent: safe, items: [cc] });
+        }
+      }
+
+      let contextBreak = false;
+
+      for (const batch of batches) {
+        if (contextBreak || this.abortController!.signal.aborted) break;
+
+        if (batch.concurrent) {
+          const results = await Promise.all(
+            batch.items.map(async (cc) => {
+              const raw = await this.executeToolForOpenAI(cc.name, cc.input);
+              const res = this.persistLargeResult(cc.name, raw);
+              printToolResult(cc.name, res);
+              return { cc, res };
+            }),
+          );
+          for (const { cc, res } of results) {
+            this.openaiMessages.push({ role: 'tool', tool_call_id: cc.tc.id, content: res });
+          }
+        } else {
+          for (const cc of batch.items) {
+            if (!cc.allowed) {
+              this.openaiMessages.push({ role: 'tool', tool_call_id: cc.tc.id, content: cc.result! });
+              continue;
+            }
+            const raw = await this.executeToolForOpenAI(cc.name, cc.input);
+            const res = this.persistLargeResult(cc.name, raw);
+            printToolResult(cc.name, res);
+
+            if (this.contextCleared) {
+              this.contextCleared = false;
+              this.openaiMessages.push({ role: 'user', content: res });
+              contextBreak = true;
+              break;
+            }
+            this.openaiMessages.push({ role: 'tool', tool_call_id: cc.tc.id, content: res });
+          }
+        }
+      }
+
+      this.contextCleared = false;
+    }
+  }
+
+  /**
+   * 判断工具是否为 Agent 内部处理的工具
+   *
+   * 这些工具不走常规的权限检查和执行路径，
+   * 而是由 Agent 自身的方法拦截处理。
+   */
+  private isInternalTool(name: string): boolean {
+    return name === 'enter_plan_mode' || name === 'exit_plan_mode' ||
+      name === 'agent' || name === 'skill' ||
+      this.mcpManager.isMcpTool(name);
+  }
+
+  /**
+   * 内部工具执行路由（Anthropic + OpenAI 共用）
+   *
+   * 处理 plan mode、agent、skill、MCP 工具。
+   * 返回执行结果字符串，如果不是内部工具则返回 null。
+   */
+  private async executeInternalTool(name: string, input: Record<string, any>): Promise<string | null> {
+    if (name === 'enter_plan_mode' || name === 'exit_plan_mode') {
+      return await this.executePlanModeTool(name);
+    }
+    if (name === 'agent') {
+      return await this.executeAgentTool(input);
+    }
+    if (name === 'skill') {
+      return await this.executeSkillTool(input);
+    }
+    if (this.mcpManager.isMcpTool(name)) {
+      if (this.permissionMode === 'plan') {
+        printDenied(this.permissionMode);
+        return 'Action denied by permission mode.';
+      }
+      try {
+        const mcpResult = await this.mcpManager.callTool(name, input);
+        return this.persistLargeResult(name, mcpResult);
+      } catch (err: any) {
+        return `MCP tool error: ${err.message}`;
+      }
+    }
+    return null;
+  }
+
+  /**
+   * OpenAI 模式的工具执行路由
+   *
+   * 统一处理内部工具和常规工具的执行。
+   */
+  private async executeToolForOpenAI(name: string, input: Record<string, any>): Promise<string> {
+    const internal = await this.executeInternalTool(name, input);
+    if (internal !== null) return internal;
+    return executeTool(name, input, this.readFileState);
+  }
+
+  /**
+   * 调用 OpenAI Chat Completions API（流式）
+   *
+   * 流式收集文本 delta 和 tool_calls delta，
+   * 最终组装为 OpenAI.ChatCompletion 对象返回。
+   *
+   * 与 Anthropic 流式的区别：
+   * - 无 content_block_stop 事件，无法提前触发工具执行
+   * - tool_calls 的 arguments 分块到达，需要按 index 累积
+   * - usage 在最后一个 chunk 中返回（需要 stream_options.include_usage）
+   */
+  private async callOpenAIStream(): Promise<OpenAI.ChatCompletion> {
+    return withRetry(async (signal) => {
+      const activeTools = this.customTools
+        ? toOpenAITools(getActiveToolDefinitions(this.customTools))
+        : toOpenAITools([...getActiveToolDefinitions(), ...this.mcpTools]);
+
+      const stream = await this.openaiClient!.chat.completions.create(
+        {
+          model: this.model,
+          max_tokens: 16384,
+          tools: activeTools,
+          messages: this.openaiMessages,
+          stream: true,
+          stream_options: { include_usage: true },
+        },
+        { signal },
+      );
+
+      let content = '';
+      let firstText = true;
+      const toolCalls = new Map<number, { id: string; name: string; arguments: string }>();
+      let finishReason = '';
+      let usage: { prompt_tokens: number; completion_tokens: number } | undefined;
+
+      for await (const chunk of stream) {
+        const delta = chunk.choices[0]?.delta;
+
+        if (chunk.usage) {
+          usage = { prompt_tokens: chunk.usage.prompt_tokens, completion_tokens: chunk.usage.completion_tokens };
+        }
+
+        if (!delta) continue;
+
+        if (delta.content) {
+          if (firstText) {
+            if (!this.isSubAgent) stopSpinner();
+            this.emitText('\n');
+            firstText = false;
+          }
+          this.emitText(delta.content);
+          content += delta.content;
+        }
+
+        if (delta.tool_calls) {
+          for (const tc of delta.tool_calls) {
+            const existing = toolCalls.get(tc.index);
+            if (existing) {
+              if (tc.function?.arguments) existing.arguments += tc.function.arguments;
+            } else {
+              toolCalls.set(tc.index, {
+                id: tc.id || '',
+                name: tc.function?.name || '',
+                arguments: tc.function?.arguments || '',
+              });
+            }
+          }
+        }
+
+        if (chunk.choices[0]?.finish_reason) {
+          finishReason = chunk.choices[0].finish_reason;
+        }
+      }
+
+      if (!firstText) this.emitText('\n');
+
+      const assembledToolCalls = toolCalls.size > 0
+        ? Array.from(toolCalls.entries())
+            .sort(([a], [b]) => a - b)
+            .map(([, tc]) => ({
+              id: tc.id,
+              type: 'function' as const,
+              function: { name: tc.name, arguments: tc.arguments },
+            }))
+        : undefined;
+
+      return {
+        id: 'stream',
+        object: 'chat.completion',
+        created: Date.now(),
+        model: this.model,
+        choices: [{
+          index: 0,
+          message: {
+            role: 'assistant' as const,
+            content: content || null,
+            tool_calls: assembledToolCalls,
+            refusal: null,
+          },
+          finish_reason: finishReason || 'stop',
+          logprobs: null,
+        }],
+        usage: usage || { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
+      } as OpenAI.ChatCompletion;
+    }, this.abortController?.signal);
   }
 
   // ─── 会话持久化 ─────────────────────────────────────
@@ -1394,15 +1727,19 @@ export class Agent {
    */
   private autoSave(): void {
     try {
+      const messageCount = this.useOpenAI
+        ? this.openaiMessages.length
+        : this.anthropicMessages.length;
       saveSession(this.sessionId, {
         metadata: {
           id: this.sessionId,
           model: this.model,
           cwd: process.cwd(),
           startTime: this.sessionStartTime,
-          messageCount: this.messages.length,
+          messageCount,
         },
-        messages: this.messages,
+        messages: this.useOpenAI ? undefined : this.anthropicMessages,
+        openaiMessages: this.useOpenAI ? this.openaiMessages : undefined,
       });
     } catch {
       // 持久化失败不应影响主流程
@@ -1460,7 +1797,7 @@ export class Agent {
           max_tokens: thinkingEnabled ? maxOutput : 16384,
           system: this.systemPrompt,
           tools: activeTools,
-          messages: this.messages,
+          messages: this.anthropicMessages,
           // thinking 参数：budget_tokens 必须严格小于 max_tokens（API 约束）
           ...(thinkingEnabled && {
             thinking: {
@@ -1666,9 +2003,14 @@ export class Agent {
 
     const config = getSubAgentConfig(type);
     const subAgent = new Agent({
-      apiKey: this.client.apiKey || '',
-      apiBaseUrl: (this.client as any).baseURL || '',
+      apiKey: this.useOpenAI
+        ? (this.openaiClient as any)?.apiKey || ''
+        : this.client.apiKey || '',
+      apiBaseUrl: this.useOpenAI
+        ? (this.openaiClient as any)?.baseURL || ''
+        : (this.client as any).baseURL || '',
       model: this.model,
+      backend: this.useOpenAI ? 'openai' : 'anthropic',
       customSystemPrompt: config.systemPrompt,
       customTools: config.tools,
       isSubAgent: true,
@@ -1729,9 +2071,14 @@ export class Agent {
 
       printSubAgentStart('general', `skill:${skillName}`);
       const subAgent = new Agent({
-        apiKey: this.client.apiKey || '',
-        apiBaseUrl: (this.client as any).baseURL || '',
+        apiKey: this.useOpenAI
+          ? (this.openaiClient as any)?.apiKey || ''
+          : this.client.apiKey || '',
+        apiBaseUrl: this.useOpenAI
+          ? (this.openaiClient as any)?.baseURL || ''
+          : (this.client as any).baseURL || '',
         model: this.model,
+        backend: this.useOpenAI ? 'openai' : 'anthropic',
         customSystemPrompt: result.prompt,
         customTools: tools,
         isSubAgent: true,
@@ -1933,7 +2280,11 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
    * 所以清空 messages 不会影响系统提示。
    */
   private clearHistoryKeepSystem(): void {
-    this.messages = [];
+    this.anthropicMessages = [];
+    this.openaiMessages = [];
+    if (this.useOpenAI) {
+      this.openaiMessages.push({ role: 'system', content: this.systemPrompt });
+    }
     this.lastInputTokenCount = 0;
   }
 
@@ -1948,9 +2299,15 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
    * - Tier 3: 缓存冷却后激进清理（空闲 > 5 分钟）
    */
   private runCompressionPipeline(): void {
-    this.budgetToolResults();
-    this.snipStaleResults();
-    this.microcompact();
+    if (this.useOpenAI) {
+      this.budgetToolResultsOpenAI();
+      this.snipStaleResultsOpenAI();
+      this.microcompactOpenAI();
+    } else {
+      this.budgetToolResults();
+      this.snipStaleResults();
+      this.microcompact();
+    }
   }
 
   /**
@@ -1977,7 +2334,7 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
     if (utilization < 0.5) return;
     const budget = utilization > 0.7 ? 15000 : 30000;
 
-    for (const msg of this.messages) {
+    for (const msg of this.anthropicMessages) {
       if (msg.role !== 'user' || !Array.isArray(msg.content)) continue;
       for (const block of msg.content as any[]) {
         if (
@@ -2031,8 +2388,8 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
       filePath?: string;
     }[] = [];
 
-    for (let mi = 0; mi < this.messages.length; mi++) {
-      const msg = this.messages[mi];
+    for (let mi = 0; mi < this.anthropicMessages.length; mi++) {
+      const msg = this.anthropicMessages[mi];
       if (msg.role !== 'user' || !Array.isArray(msg.content)) continue;
       for (let bi = 0; bi < msg.content.length; bi++) {
         const block = msg.content[bi] as any;
@@ -2086,7 +2443,7 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
     // Step 4: 执行替换
     for (const idx of toSnip) {
       const r = results[idx];
-      const block = (this.messages[r.msgIdx].content as any[])[r.blockIdx];
+      const block = (this.anthropicMessages[r.msgIdx].content as any[])[r.blockIdx];
       block.content = SNIP_PLACEHOLDER;
     }
   }
@@ -2121,8 +2478,8 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
 
     // 收集所有未被清理的 tool_result 块
     const allResults: { msgIdx: number; blockIdx: number }[] = [];
-    for (let mi = 0; mi < this.messages.length; mi++) {
-      const msg = this.messages[mi];
+    for (let mi = 0; mi < this.anthropicMessages.length; mi++) {
+      const msg = this.anthropicMessages[mi];
       if (msg.role !== 'user' || !Array.isArray(msg.content)) continue;
       for (let bi = 0; bi < msg.content.length; bi++) {
         const block = msg.content[bi] as any;
@@ -2141,8 +2498,74 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
     const clearCount = allResults.length - KEEP_RECENT_RESULTS;
     for (let i = 0; i < clearCount && i < allResults.length; i++) {
       const r = allResults[i];
-      (this.messages[r.msgIdx].content as any[])[r.blockIdx].content =
+      (this.anthropicMessages[r.msgIdx].content as any[])[r.blockIdx].content =
         '[Old result cleared]';
+    }
+  }
+
+  // ─── OpenAI 压缩管道方法 ──────────────────────────────
+
+  /** Tier 1: 按预算截断大工具结果（OpenAI 格式 — role=tool 消息） */
+  private budgetToolResultsOpenAI(): void {
+    const utilization = this.lastInputTokenCount / this.effectiveWindow;
+    if (utilization < 0.5) return;
+    const budget = utilization > 0.7 ? 15000 : 30000;
+
+    for (const msg of this.openaiMessages) {
+      if ((msg as any).role === 'tool' && typeof (msg as any).content === 'string') {
+        const content = (msg as any).content as string;
+        if (content.length > budget) {
+          const keepEach = Math.floor((budget - 80) / 2);
+          (msg as any).content =
+            content.slice(0, keepEach) +
+            `\n\n[... budgeted: ${content.length - keepEach * 2} chars truncated ...]\n\n` +
+            content.slice(-keepEach);
+        }
+      }
+    }
+  }
+
+  /** Tier 2: snip 旧工具结果（OpenAI 格式 — 按消息顺序保留最近 N 个） */
+  private snipStaleResultsOpenAI(): void {
+    const utilization = this.lastInputTokenCount / this.effectiveWindow;
+    if (utilization < SNIP_THRESHOLD) return;
+
+    const toolMsgs: { idx: number; toolCallId: string }[] = [];
+    for (let i = 0; i < this.openaiMessages.length; i++) {
+      const msg = this.openaiMessages[i] as any;
+      if (msg.role === 'tool' && typeof msg.content === 'string' && msg.content !== SNIP_PLACEHOLDER) {
+        toolMsgs.push({ idx: i, toolCallId: msg.tool_call_id });
+      }
+    }
+
+    if (toolMsgs.length <= KEEP_RECENT_RESULTS) return;
+
+    const snipCount = toolMsgs.length - KEEP_RECENT_RESULTS;
+    for (let i = 0; i < snipCount; i++) {
+      (this.openaiMessages[toolMsgs[i].idx] as any).content = SNIP_PLACEHOLDER;
+    }
+  }
+
+  /** Tier 3: 缓存冷却后激进清理（OpenAI 格式） */
+  private microcompactOpenAI(): void {
+    if (!this.lastApiCallTime || Date.now() - this.lastApiCallTime < MICROCOMPACT_IDLE_MS) return;
+
+    const toolMsgs: number[] = [];
+    for (let i = 0; i < this.openaiMessages.length; i++) {
+      const msg = this.openaiMessages[i] as any;
+      if (
+        msg.role === 'tool' &&
+        typeof msg.content === 'string' &&
+        msg.content !== SNIP_PLACEHOLDER &&
+        msg.content !== '[Old result cleared]'
+      ) {
+        toolMsgs.push(i);
+      }
+    }
+
+    const clearCount2 = toolMsgs.length - KEEP_RECENT_RESULTS;
+    for (let i = 0; i < clearCount2 && i < toolMsgs.length; i++) {
+      (this.openaiMessages[toolMsgs[i]] as any).content = '[Old result cleared]';
     }
   }
 
@@ -2192,49 +2615,79 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
    * 安全阈值：messages.length < 4 时不压缩（对话太短没有压缩价值）。
    */
   private async compactConversation(): Promise<void> {
-    if (this.messages.length < 4) return;
+    if (this.useOpenAI) {
+      await this.compactOpenAI();
+    } else {
+      await this.compactAnthropic();
+    }
+  }
 
-    // 保存最后一条消息（当前轮的 user 输入）
-    const lastUserMsg = this.messages[this.messages.length - 1];
+  private async compactAnthropic(): Promise<void> {
+    if (this.anthropicMessages.length < 4) return;
 
-    // 调用 API 生成对话摘要
+    const lastUserMsg = this.anthropicMessages[this.anthropicMessages.length - 1];
+
     const summaryResp = await this.client.messages.create({
       model: this.model,
       max_tokens: 2048,
-      system:
-        'You are a conversation summarizer. Be concise but preserve important details.',
+      system: 'You are a conversation summarizer. Be concise but preserve important details.',
       messages: [
-        // 历史消息（不含最后一条 user 输入）
-        ...this.messages.slice(0, -1),
-        // 替换为"请总结"指令
+        ...this.anthropicMessages.slice(0, -1),
         {
           role: 'user',
-          content:
-            'Summarize the conversation so far in a concise paragraph, preserving key decisions, file paths, and context needed to continue the work.',
+          content: 'Summarize the conversation so far in a concise paragraph, preserving key decisions, file paths, and context needed to continue the work.',
         },
       ],
     });
 
-    // 提取摘要文本
     const summaryText =
       summaryResp.content[0]?.type === 'text'
         ? summaryResp.content[0].text
         : 'No summary available.';
 
-    // 用摘要重建 messages 数组
-    this.messages = [
-      {
-        role: 'user',
-        content: `[Previous conversation summary]\n${summaryText}`,
-      },
-      {
-        role: 'assistant',
-        content:
-          'Understood. I have the context from our previous conversation. How can I continue helping?',
-      },
+    this.anthropicMessages = [
+      { role: 'user', content: `[Previous conversation summary]\n${summaryText}` },
+      { role: 'assistant', content: 'Understood. I have the context from our previous conversation. How can I continue helping?' },
     ];
-    // 把当前轮的 user 输入追加回去
-    if (lastUserMsg.role === 'user') this.messages.push(lastUserMsg);
+    if (lastUserMsg.role === 'user') this.anthropicMessages.push(lastUserMsg);
+    this.lastInputTokenCount = 0;
+    printInfo('Conversation compacted.');
+  }
+
+  /**
+   * OpenAI 对话压缩
+   *
+   * 与 Anthropic 版本的区别：
+   * - system message (messages[0]) 需要保留
+   * - 使用 OpenAI Chat Completions API 进行摘要
+   */
+  private async compactOpenAI(): Promise<void> {
+    if (this.openaiMessages.length < 5) return;
+
+    const systemMsg = this.openaiMessages[0];
+    const lastUserMsg = this.openaiMessages[this.openaiMessages.length - 1];
+
+    const summaryResp = await this.openaiClient!.chat.completions.create({
+      model: this.model,
+      max_tokens: 2048,
+      messages: [
+        { role: 'system', content: 'You are a conversation summarizer. Be concise but preserve important details.' },
+        ...this.openaiMessages.slice(1, -1) as any[],
+        {
+          role: 'user',
+          content: 'Summarize the conversation so far in a concise paragraph, preserving key decisions, file paths, and context needed to continue the work.',
+        },
+      ],
+    });
+
+    const summaryText = summaryResp.choices[0]?.message?.content || 'No summary available.';
+
+    this.openaiMessages = [
+      systemMsg,
+      { role: 'user', content: `[Previous conversation summary]\n${summaryText}` },
+      { role: 'assistant', content: 'Understood. I have the context from our previous conversation. How can I continue helping?' },
+    ];
+    if ((lastUserMsg as any).role === 'user') this.openaiMessages.push(lastUserMsg);
     this.lastInputTokenCount = 0;
     printInfo('Conversation compacted.');
   }
@@ -2257,7 +2710,7 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
   private findToolUseById(
     toolUseId: string,
   ): { name: string; input: any } | null {
-    for (const msg of this.messages) {
+    for (const msg of this.anthropicMessages) {
       if (msg.role !== 'assistant' || !Array.isArray(msg.content)) continue;
       for (const block of msg.content as any[]) {
         if (block.type === 'tool_use' && block.id === toolUseId) {

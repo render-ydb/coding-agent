@@ -50,11 +50,18 @@ export interface SessionMetadata {
  * messages 类型为 any[] 而非 Anthropic.MessageParam[]，
  * 这样 session 模块不需要依赖 Anthropic SDK。
  * Agent 在 restoreSession() 中会将其 cast 为正确类型。
+ *
+ * 双后端支持：
+ * - messages: Anthropic 格式（Anthropic 后端时填充）
+ * - openaiMessages: OpenAI 格式（OpenAI 后端时填充）
+ * 两者互斥，恢复时根据哪个字段有值决定加载目标。
  */
 export interface SessionData {
   metadata: SessionMetadata;
-  /** 对话消息数组（Anthropic MessageParam 格式的 JSON 序列化形式） */
-  messages: any[];
+  /** Anthropic 格式的对话消息数组（Anthropic 后端使用） */
+  messages?: any[];
+  /** OpenAI 格式的对话消息数组（OpenAI 兼容后端使用） */
+  openaiMessages?: any[];
 }
 
 /**
